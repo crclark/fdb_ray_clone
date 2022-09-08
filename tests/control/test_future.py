@@ -217,7 +217,7 @@ def test_await_future_dead_worker(db: fdb.Database, subspace: fdb.Subspace) -> N
     future.write_worker_heartbeat(db, subspace, worker_id, heartbeat)
 
     result = future.await_future(
-        db, subspace, f, time_limit_secs=10, presume_worker_dead_after_secs=100
+        db, subspace, f, time_limit_secs=10, presume_worker_dead_after_secs=1
     )
 
     assert result == future.AwaitFailed.WorkerPresumedDead

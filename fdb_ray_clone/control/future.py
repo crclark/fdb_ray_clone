@@ -822,16 +822,19 @@ def _await_future_watch(
     if isinstance(future_watch, FutureFDBWatch):
         started_at = seconds_since_epoch()
         last_worker_heartbeat_at = None
+        curr_poll_wait = 1
+        max_poll_wait = 16
         while True:
+            wait_duration = seconds_since_epoch() - started_at
             if future_watch.fdb_watch.is_ready():
                 result: FutureResult[T] = _get_future_watch_result(db, future_watch)
                 return result
-            elif (
-                time_limit_secs is not None
-                and seconds_since_epoch() - started_at > time_limit_secs
-            ):
+            elif time_limit_secs is not None and wait_duration > time_limit_secs:
                 return AwaitFailed.TimeLimitExceeded
-            elif presume_worker_dead_after_secs is not None:
+            elif (
+                presume_worker_dead_after_secs is not None
+                and wait_duration > presume_worker_dead_after_secs
+            ):
                 last_worker_heartbeat_at = _future_worker_latest_heartbeat(
                     db, ss, future_id
                 )
@@ -843,7 +846,8 @@ def _await_future_watch(
                 ):
                     return AwaitFailed.WorkerPresumedDead
             else:
-                time.sleep(1)
+                time.sleep(curr_poll_wait)
+                curr_poll_wait = min(curr_poll_wait * 2, max_poll_wait)
     else:
         return future_watch
 
