@@ -14,6 +14,7 @@ pyarrow = "^9.0.0"
 pytest = "^6.2.5"
 black = "^22.3.0"
 mypy = "^0.960"
+hypothesis = "^6.54.5"
 
 [build-system]
 requires = ["poetry-core>=1.0.0"]

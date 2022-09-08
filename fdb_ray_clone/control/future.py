@@ -6,7 +6,7 @@
    NOT the data plane state. The worker logic is responsible for orchestrating
    the two."""
 
-
+import cloudpickle
 from dataclasses import dataclass
 import pickle
 from typing import Any, Callable, Generic, List, Optional, TypeVar, Union
@@ -15,19 +15,37 @@ import uuid
 import fdb
 import time
 
-import fdb_ray_clone.fdb_utils as fdb_utils
-
 fdb.api_version(710)
 
 T = TypeVar("T")
-U = TypeVar("U")
 
 
-def fmap(f: Callable[[T], U], x: Optional[T]) -> Optional[U]:
-    if x is not None:
-        return f(x)
-    else:
+def unpickle(x: "fdb.Value") -> Optional[T]:
+    if not x.present():
         return None
+    else:
+        result: T = pickle.loads(x.value)
+        return result
+
+
+def must_unpickle(x: "fdb.Value") -> T:
+    if not x.present():
+        raise Exception("Value not present")
+    else:
+        result: T = pickle.loads(x.value)
+        return result
+
+
+def add(x: int, y: int) -> int:
+    return x + y
+
+
+class FutureDoesNotExistException(Exception):
+    pass
+
+
+class ClaimLostException(Exception):
+    pass
 
 
 """
@@ -336,7 +354,7 @@ Future = Union[UnclaimedFuture[T], ClaimedFuture[T], RealizedFuture[T], FailedFu
 
 @dataclass(frozen=True)
 class FutureFDBWatch(Generic[T]):
-    fdb_watch: fdb.FutureVoid
+    fdb_watch: fdb.Future
     key: bytes
 
 
@@ -353,7 +371,7 @@ def write_resource_requirements(
     for resource in ["cpu", "ram", "gpu"]:
         resource_ss = ss.subspace((f"resource_requirements_{resource}",))
         req = resource_requirements.__getattribute__(resource)
-        tr[resource_ss.pack((req, future_id))] = ""
+        tr[resource_ss.pack((req, future_id))] = b""
 
 
 @fdb.transactional
@@ -377,10 +395,11 @@ def submit_future(
     dependencies: List[Any],
     resource_requirements: ResourceRequirements,
     max_retries: int = 3,
+    id: Optional[UUID] = None,
 ) -> UnclaimedFuture[T]:
     # TODO: throw exception if dependencies are huge after pickling, instead of
     # letting the transaction fail.
-    id = uuid.uuid4()
+    id = id or uuid.uuid4()
     future = UnclaimedFuture(
         id=id,
         code=future_code,
@@ -388,35 +407,51 @@ def submit_future(
         resource_requirements=resource_requirements,
         max_retries=max_retries,
     )
-    future_ss = ss.subspace(("future",))
-    fdb_utils.write_dataclass(tr, future_ss, future)
+    future_ss = ss.subspace(("future", id))
+    tr[future_ss.pack(("code",))] = cloudpickle.dumps(future_code)
+    tr[future_ss.pack(("dependencies",))] = cloudpickle.dumps(dependencies)
+    tr[future_ss.pack(("resource_requirements",))] = pickle.dumps(resource_requirements)
+    tr[future_ss.pack(("max_retries",))] = pickle.dumps(max_retries)
 
-    write_resource_requirements(tr, ss, future)
+    write_resource_requirements(tr, ss, future.id, resource_requirements)
     return future
 
 
-# TODO: just take future_id as input?
+@fdb.transactional
+def future_exists(tr: fdb.Transaction, ss: fdb.Subspace, id: UUID) -> bool:
+    future_ss = ss.subspace(("future", id))
+    result: bool = tr.get(future_ss.pack(("code",))).wait().present()
+    return result
+
+
 @fdb.transactional
 def get_future_state(  # type: ignore [return] # TODO: wtf
-    tr: fdb.Transaction, ss: fdb.Subspace, future: BaseFuture[T]
-) -> Future[T]:
-    future_ss = ss.subspace(("future", future.id))
+    tr: fdb.Transaction, ss: fdb.Subspace, future: Union[UUID, BaseFuture[T]]
+) -> Optional[Future[T]]:
+    """Get the state of a future, identified either by its UUID or a future
+    object. Returns None if the future does not exist in FoundationDB."""
+
+    future_id = future if isinstance(future, UUID) else future.id
+    future_ss = ss.subspace(("future", future_id))
 
     # keys we need to be able to decide which case to return (unclaimed, etc.)
-    claim = future_ss["claim"]
-    latest_result = future_ss["latest_result"]
-    num_attempts = future_ss["num_attempts"]
-    max_retries = future_ss["max_retries"]
-    claim = fmap(pickle.loads, claim.wait())
-    latest_result = fmap(pickle.loads, latest_result.wait())
-    num_attempts = fmap(pickle.loads, num_attempts.wait())
-    max_retries = fmap(pickle.loads, max_retries.wait())
+    claim = tr[future_ss["claim"]]
+    latest_result = tr[future_ss["latest_result"]]
+    num_attempts = tr[future_ss["num_attempts"]]
+    max_retries = tr[future_ss["max_retries"]]
+    claim = unpickle(claim.wait())
+    latest_result = unpickle(latest_result.wait())
+    num_attempts = unpickle(num_attempts.wait()) or 0
+    max_retries = unpickle(max_retries.wait())
 
     # The remaining keys
-    code = future_ss["code"]
-    dependencies = future_ss["dependencies"]
-    resource_requirements = future_ss["resource_requirements"]
-    latest_exception = future_ss["latest_exception"]
+    code = tr[future_ss["code"]]
+    dependencies = tr[future_ss["dependencies"]]
+    resource_requirements = tr[future_ss["resource_requirements"]]
+    latest_exception = tr[future_ss["latest_exception"]]
+
+    if not future_exists(tr, ss, future_id):
+        return None
 
     match (
         claim,
@@ -424,12 +459,12 @@ def get_future_state(  # type: ignore [return] # TODO: wtf
         num_attempts,
         max_retries,
     ):
-        case (None, None, None, max_retries):
+        case (None, _, _, max_retries):
             return UnclaimedFuture(
-                id=future.id,
-                code=pickle.loads(code.wait()),
-                dependencies=pickle.loads(dependencies.wait()),
-                resource_requirements=pickle.loads(resource_requirements.wait()),
+                id=future_id,
+                code=must_unpickle(code.wait()),
+                dependencies=must_unpickle(dependencies.wait()),
+                resource_requirements=must_unpickle(resource_requirements.wait()),
                 max_retries=max_retries,
             )
         case (
@@ -439,38 +474,38 @@ def get_future_state(  # type: ignore [return] # TODO: wtf
             max_retries,
         ) if num_attempts >= max_retries + 1:
             return FailedFuture(
-                id=future.id,
-                code=pickle.loads(code.wait()),
-                dependencies=pickle.loads(dependencies.wait()),
-                resource_requirements=pickle.loads(resource_requirements.wait()),
+                id=future_id,
+                code=must_unpickle(code.wait()),
+                dependencies=must_unpickle(dependencies.wait()),
+                resource_requirements=must_unpickle(resource_requirements.wait()),
                 max_retries=max_retries,
                 claim=claim,
                 num_attempts=num_attempts,
-                latest_exception=pickle.loads(latest_exception.wait()),
+                latest_exception=must_unpickle(latest_exception.wait()),
             )
 
         case (claim, None, num_attempts, max_retries):
             return ClaimedFuture(
-                id=future.id,
-                code=pickle.loads(code.wait()),
-                dependencies=pickle.loads(dependencies.wait()),
-                resource_requirements=pickle.loads(resource_requirements.wait()),
+                id=future_id,
+                code=must_unpickle(code.wait()),
+                dependencies=must_unpickle(dependencies.wait()),
+                resource_requirements=must_unpickle(resource_requirements.wait()),
                 max_retries=max_retries,
                 claim=claim,
                 num_attempts=num_attempts or 0,
-                latest_exception=fmap(pickle.loads, latest_exception.wait()),
+                latest_exception=unpickle(latest_exception.wait()),
             )
         case (claim, latest_result, num_attempts, max_retries):
             return RealizedFuture(
-                id=future.id,
-                code=pickle.loads(code.wait()),
-                dependencies=pickle.loads(dependencies.wait()),
-                resource_requirements=pickle.loads(resource_requirements.wait()),
+                id=future_id,
+                code=must_unpickle(code.wait()),
+                dependencies=must_unpickle(dependencies.wait()),
+                resource_requirements=must_unpickle(resource_requirements.wait()),
                 max_retries=max_retries,
                 claim=claim,
                 num_attempts=num_attempts,
                 latest_result=latest_result,
-                latest_exception=fmap(pickle.loads, latest_exception.wait()),
+                latest_exception=unpickle(latest_exception.wait()),
             )
         case _:
             raise Exception(
@@ -488,7 +523,16 @@ def claim_future(
     worker_address: str,
     worker_port: int,
 ) -> ClaimedFuture[T]:
-    clear_resource_requirements(tr, ss, future.id)
+    """Claim a future for the given worker. If the future is already claimed,
+    that claim is overwritten and invalidated. This also resets the
+    num_attempts counter (under the assumption that the new worker may be
+    in a better state than the previous worker attempting to work on the
+    future -- e.g., more memory)."""
+
+    if not future_exists(tr, ss, future.id):
+        raise FutureDoesNotExistException(future.id)
+
+    clear_resource_requirements(tr, ss, future.id, future.resource_requirements)
     claim = FutureClaim(
         worker_id=WorkerId(worker_address, worker_port),
         claimed_at=seconds_since_epoch(),
@@ -512,8 +556,6 @@ def realize_future(
     tr: fdb.Transaction,
     ss: fdb.Subspace,
     future: ClaimedFuture[T],
-    worker_address: str,
-    worker_port: int,
     name: str,
 ) -> RealizedFuture[T]:
     """
@@ -522,13 +564,17 @@ def realize_future(
     Throws without recording the result if the worker's claim on the future has
     expired.
     """
-    worker_id = WorkerId(worker_address, worker_port)
+
+    if not future_exists(tr, ss, future.id):
+        raise FutureDoesNotExistException(future.id)
+
+    worker_id = future.claim.worker_id
     future_ss = ss.subspace(("future", future.id))
-    latest_claim = fmap(pickle.loads, future_ss["claim"].wait())
-    latest_exception = fmap(pickle.loads, future_ss["latest_exception"].wait())
+    latest_claim = unpickle(tr[future_ss["claim"]].wait())
+    latest_exception = unpickle(tr[future_ss["latest_exception"]].wait())
     # Copilot reminded me to write this condition :)
     if not latest_claim or latest_claim != future.claim:
-        raise Exception(
+        raise ClaimLostException(
             f"Worker {worker_id} lost claim on Future {future.id} while working on it. Current claim is {latest_claim}."
         )
     future_result: FutureResult[T] = FutureResult(
@@ -538,7 +584,7 @@ def realize_future(
     )
     tr[future_ss["latest_result"]] = pickle.dumps(future_result)
     # TODO: blind writes are brittle
-    tr[future_ss["num_attempts"]] = future.num_attempts + 1
+    tr[future_ss["num_attempts"]] = pickle.dumps(future.num_attempts + 1)
     return RealizedFuture(
         id=future.id,
         code=future.code,
@@ -563,6 +609,10 @@ def fail_future(
        increments num_attempts on the future.
     Returns a FailedFuture if the future has exceeded its max_retries.
     Throws if the future has been claimed by another worker."""
+
+    if not future_exists(tr, ss, future.id):
+        raise FutureDoesNotExistException(future.id)
+
     # convert exception to FutureException and store it in the future
     try:
         pickle.dumps(exception)
@@ -574,15 +624,15 @@ def fail_future(
             exception=None, exception_type=exception.__class__
         )
     future_ss = ss.subspace(("future", future.id))
-    latest_claim = fmap(pickle.loads, future_ss["claim"].wait())
+    latest_claim = unpickle(tr[future_ss["claim"]].wait())
     if not latest_claim or latest_claim != future.claim:
-        raise Exception(
+        raise ClaimLostException(
             f"Worker {future.claim.worker_id} lost claim on Future {future.id} while working on it. Current claim is {latest_claim}."
         )
     future_ss = ss.subspace(("future", future.id))
     tr[future_ss["latest_exception"]] = pickle.dumps(future_exception)
     # TODO: blind writes are brittle
-    tr[future_ss["num_attempts"]] = future.num_attempts + 1
+    tr[future_ss["num_attempts"]] = pickle.dumps(future.num_attempts + 1)
 
     if future.num_attempts + 1 >= future.max_retries:
         return FailedFuture(
@@ -615,9 +665,7 @@ def _create_future_watch(
     """Registers a watch with FDB on the result of the future. Must be awaited
     after the transaction has been committed."""
     future_ss = ss.subspace(("future", future.id))
-    result: Optional[FutureResult[T]] = fmap(
-        pickle.loads, future_ss["latest_result"].wait()
-    )
+    result: Optional[FutureResult[T]] = unpickle(tr[future_ss["latest_result"]].wait())
     if result:
         return result
     else:
@@ -629,9 +677,7 @@ def _create_future_watch(
 def _get_future_watch_result(
     tr: fdb.Transaction, future_watch: FutureFDBWatch[T]
 ) -> FutureResult[T]:
-    result: Optional[FutureResult[T]] = fmap(
-        pickle.loads, tr.get(future_watch.key).wait()
-    )
+    result: Optional[FutureResult[T]] = unpickle(tr.get(future_watch.key).wait())
     if result:
         return result
     else:
@@ -663,11 +709,14 @@ def _await_future_watch(
 
 def await_future(
     db: fdb.Database,
+    ss: fdb.Subspace,
     future: Future[T],
     time_limit_secs: Optional[int] = None,
 ) -> Optional[FutureResult[T]]:
     """Blocks until the future has been realized and returns its result. If time limit is exceeded, returns None."""
-    return _await_future_watch(db, _create_future_watch(db, future), time_limit_secs)
+    return _await_future_watch(
+        db, _create_future_watch(db, ss, future), time_limit_secs
+    )
 
 
 @fdb.transactional
