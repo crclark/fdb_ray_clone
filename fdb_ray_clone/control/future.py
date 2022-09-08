@@ -6,6 +6,7 @@
    NOT the data plane state. The worker logic is responsible for orchestrating
    the two."""
 
+from enum import Enum
 import cloudpickle
 from dataclasses import dataclass
 import pickle
@@ -45,10 +46,6 @@ def must_unpickle(x: "fdb.Value") -> T:
     else:
         result: T = pickle.loads(x.value)
         return result
-
-
-def add(x: int, y: int) -> int:
-    return x + y
 
 
 class FutureDoesNotExistException(Exception):
@@ -441,13 +438,42 @@ def futures_fitting_resources(
     return list(ret)
 
 
-# TODO: heartbeat management
-# @fdb.transactional
-# def write_worker_heartbeat(
-#     tr: fdb.Transaction, ss: fdb.Subspace, worker_id: WorkerId, heartbeat: WorkerHeartbeat
-# ) -> None:
-#     worker_ss = ss.subspace((f"worker",))
-#     tr[worker_ss.pack((worker_id, heartbeat.last_heartbeat_at))] = b""
+@fdb.transactional
+def write_worker_heartbeat(
+    tr: fdb.Transaction,
+    ss: fdb.Subspace,
+    worker_id: WorkerId,
+    heartbeat: WorkerHeartbeat,
+) -> None:
+    worker_ss = ss.subspace((f"workers",))
+    # Reading a somewhat stale heartbeat is okay.
+    tr.options.set_next_write_no_write_conflict_range()
+    tr[worker_ss.pack((worker_id.address, worker_id.port))] = pickle.dumps(heartbeat)
+
+
+@fdb.transactional
+def get_worker_heartbeat(
+    tr: fdb.Transaction,
+    ss: fdb.Subspace,
+    worker_id: WorkerId,
+) -> Optional[WorkerHeartbeat]:
+    worker_ss = ss.subspace((f"workers",))
+    val = tr[worker_ss.pack((worker_id.address, worker_id.port))]
+    return unpickle(val)
+
+
+@fdb.transactional
+def all_worker_heartbeats(
+    tr: fdb.Transaction,
+    ss: fdb.Subspace,
+) -> Dict[WorkerId, WorkerHeartbeat]:
+    worker_ss = ss.subspace((f"workers",))
+    ret: Dict[WorkerId, WorkerHeartbeat] = dict()
+    for key, val in tr.get_range(worker_ss.range().start, worker_ss.range().stop):
+        worker_id = WorkerId(*worker_ss.unpack(key))
+        heartbeat: WorkerHeartbeat = pickle.loads(val)
+        ret[worker_id] = heartbeat
+    return ret
 
 
 @fdb.transactional
@@ -485,6 +511,16 @@ def future_exists(tr: fdb.Transaction, ss: fdb.Subspace, id: UUID) -> bool:
     future_ss = ss.subspace(("future", id))
     result: bool = tr.get(future_ss.pack(("code",))).wait().present()
     return result
+
+
+@fdb.transactional
+def get_future_claim(
+    tr: fdb.Transaction, ss: fdb.Subspace, id: UUID
+) -> Optional[FutureClaim]:
+    """Returns the claim for the given future, or None if the future is unclaimed or does not exist."""
+    future_ss = ss.subspace(("future", id))
+    claim = tr[future_ss["claim"]].wait()
+    return unpickle(claim)
 
 
 @fdb.transactional
@@ -747,14 +783,45 @@ def _get_future_watch_result(
         raise Exception("Watch triggered but no result found.")
 
 
+@fdb.transactional
+def _future_worker_latest_heartbeat(
+    tr: fdb.Transaction, ss: fdb.Subspace, future_id: UUID
+) -> Optional[int]:
+    """Returns the timestamp of the latest heartbeat for the worker that is
+    currently working on the future. Returns None if no worker is working on it."""
+    claim = get_future_claim(tr, ss, future_id)
+    if claim:
+        worker_id = claim.worker_id
+        heartbeat = get_worker_heartbeat(tr, ss, worker_id)
+        if not heartbeat:
+            raise Exception(
+                f"Worker {worker_id} has claimed a future but has no heartbeat."
+            )
+        else:
+            last_heartbeat_at: int = heartbeat.last_heartbeat_at
+            return last_heartbeat_at
+    else:
+        return None
+
+
+class AwaitFailed(Enum):
+    TimeLimitExceeded = 1
+    WorkerPresumedDead = 2
+
+
 def _await_future_watch(
     db: fdb.Database,
+    ss: fdb.Subspace,
     future_watch: FutureWatch[T],
+    future_id: UUID,
     time_limit_secs: Optional[int] = None,
-) -> Optional[FutureResult[T]]:
+    presume_worker_dead_after_secs: Optional[int] = None,
+) -> Union[AwaitFailed, FutureResult[T]]:
     """Blocks until the future has been realized and returns its result. If time limit is exceeded, returns None."""
+    print(f"Awaiting future watch... {presume_worker_dead_after_secs}")
     if isinstance(future_watch, FutureFDBWatch):
         started_at = seconds_since_epoch()
+        last_worker_heartbeat_at = None
         while True:
             if future_watch.fdb_watch.is_ready():
                 result: FutureResult[T] = _get_future_watch_result(db, future_watch)
@@ -763,7 +830,18 @@ def _await_future_watch(
                 time_limit_secs is not None
                 and seconds_since_epoch() - started_at > time_limit_secs
             ):
-                return None
+                return AwaitFailed.TimeLimitExceeded
+            elif presume_worker_dead_after_secs is not None:
+                last_worker_heartbeat_at = _future_worker_latest_heartbeat(
+                    db, ss, future_id
+                )
+                print(f"Worker last heartbeat at {last_worker_heartbeat_at}")
+                if (
+                    last_worker_heartbeat_at is not None
+                    and seconds_since_epoch() - last_worker_heartbeat_at
+                    > presume_worker_dead_after_secs
+                ):
+                    return AwaitFailed.WorkerPresumedDead
             else:
                 time.sleep(1)
     else:
@@ -775,10 +853,20 @@ def await_future(
     ss: fdb.Subspace,
     future: Future[T],
     time_limit_secs: Optional[int] = None,
-) -> Optional[FutureResult[T]]:
-    """Blocks until the future has been realized and returns its result. If time limit is exceeded, returns None."""
+    presume_worker_dead_after_secs: Optional[int] = None,
+) -> Union[AwaitFailed, FutureResult[T]]:
+    """Blocks until the future has been realized and returns its result.
+    If time limit is exceeded, returns AwaitFailed.TimeLimitExceeded.
+    If presume_worker_dead_after_secs is provided, returns AwaitFailed.WorkerPresumedDead
+    if we haven't seen a heartbeat from the worker that claimed the future within that time.
+    This logic only takes effect after the future has been claimed."""
     return _await_future_watch(
-        db, _create_future_watch(db, ss, future), time_limit_secs
+        db,
+        ss,
+        _create_future_watch(db, ss, future),
+        future.id,
+        time_limit_secs,
+        presume_worker_dead_after_secs,
     )
 
 

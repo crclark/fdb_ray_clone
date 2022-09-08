@@ -69,12 +69,15 @@ def test_claim_future(db: fdb.Database, subspace: fdb.Subspace) -> None:
 
     f_claim_ret = future.claim_future(db, subspace, f, "localhost", 1234)
     f_claim_state = future.get_future_state(db, subspace, f)
+    get_claim_ret = future.get_future_claim(db, subspace, f.id)
 
-    assert f_claim_ret.claim == f_claim_state.claim
+    assert f_claim_ret.claim == f_claim_state.claim == get_claim_ret
 
     assert isinstance(f_claim_state, future.ClaimedFuture)
     assert f_claim_state.claim.worker_id.address == "localhost"
     assert f_claim_state.claim.worker_id.port == 1234
+    assert get_claim_ret.worker_id.address == "localhost"
+    assert get_claim_ret.worker_id.port == 1234
 
 
 def test_claim_nonexistent_future(
@@ -194,7 +197,52 @@ def test_await_future_timeout(db: fdb.Database, subspace: fdb.Subspace) -> None:
         db, subspace, lambda x, y: x + y, [1, 2], future.ResourceRequirements()
     )
 
-    assert future.await_future(db, subspace, f, time_limit_secs=1) is None
+    assert (
+        future.await_future(db, subspace, f, time_limit_secs=1)
+        == future.AwaitFailed.TimeLimitExceeded
+    )
+
+
+def test_await_future_dead_worker(db: fdb.Database, subspace: fdb.Subspace) -> None:
+    f = future.submit_future(
+        db, subspace, lambda x, y: x + y, [1, 2], future.ResourceRequirements()
+    )
+    worker_id = future.WorkerId("localhost", 1234)
+    f = future.claim_future(db, subspace, f, worker_id.address, worker_id.port)
+    heartbeat = future.WorkerHeartbeat(
+        last_heartbeat_at=0,
+        started_at=0,
+        available_resources=future.WorkerResources(cpu=1, ram=1, gpu=1),
+    )
+    future.write_worker_heartbeat(db, subspace, worker_id, heartbeat)
+
+    result = future.await_future(
+        db, subspace, f, time_limit_secs=10, presume_worker_dead_after_secs=100
+    )
+
+    assert result == future.AwaitFailed.WorkerPresumedDead
+
+
+def test_await_future_live_worker(db: fdb.Database, subspace: fdb.Subspace) -> None:
+    f = future.submit_future(
+        db, subspace, lambda x, y: x + y, [1, 2], future.ResourceRequirements()
+    )
+    worker_id = future.WorkerId("localhost", 1234)
+    f = future.claim_future(db, subspace, f, worker_id.address, worker_id.port)
+    f = future.realize_future(db, subspace, f, "buffername")
+    heartbeat = future.WorkerHeartbeat(
+        last_heartbeat_at=future.seconds_since_epoch(),
+        started_at=0,
+        available_resources=future.WorkerResources(cpu=1, ram=1, gpu=1),
+    )
+    future.write_worker_heartbeat(db, subspace, worker_id, heartbeat)
+
+    result = future.await_future(
+        db, subspace, f, time_limit_secs=10, presume_worker_dead_after_secs=100
+    )
+
+    assert result is not None
+    assert result.name == "buffername"
 
 
 def test_scan_resource_requirements(db: fdb.Database, subspace: fdb.Subspace) -> None:
@@ -219,6 +267,47 @@ def test_scan_resource_requirements(db: fdb.Database, subspace: fdb.Subspace) ->
     assert futures[1].id in relevant_futures
     assert futures[2].id not in relevant_futures
     assert futures[3].id not in relevant_futures
+
+
+def test_worker_heartbeat(db: fdb.Database, subspace: fdb.Subspace) -> None:
+    worker_id = future.WorkerId("localhost", 1234)
+    heartbeat = future.WorkerHeartbeat(
+        last_heartbeat_at=future.seconds_since_epoch(),
+        started_at=future.seconds_since_epoch(),
+        available_resources=future.WorkerResources(1, 2, 3),
+    )
+    future.write_worker_heartbeat(
+        db,
+        subspace,
+        worker_id,
+        heartbeat,
+    )
+
+    ret_heartbeat = future.get_worker_heartbeat(db, subspace, worker_id)
+    assert ret_heartbeat is not None
+    assert ret_heartbeat == heartbeat
+
+
+def test_all_worker_heartbeats(db: fdb.Database, subspace: fdb.Subspace) -> None:
+    worker_ids = [future.WorkerId("localhost", i) for i in range(1, 4)]
+    heartbeat = future.WorkerHeartbeat(
+        last_heartbeat_at=future.seconds_since_epoch(),
+        started_at=future.seconds_since_epoch(),
+        available_resources=future.WorkerResources(1, 2, 3),
+    )
+    for worker_id in worker_ids:
+        future.write_worker_heartbeat(
+            db,
+            subspace,
+            worker_id,
+            heartbeat,
+        )
+
+    heartbeats = future.all_worker_heartbeats(db, subspace)
+    assert len(heartbeats) == 3
+    for worker_id in worker_ids:
+        assert worker_id in heartbeats
+        assert heartbeats[worker_id] == heartbeat
 
 
 # TODO: fix the state machine tests -- non-deterministic somehow
