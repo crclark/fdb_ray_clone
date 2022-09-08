@@ -618,32 +618,41 @@ def get_future_state(  # type: ignore [return] # TODO: wtf
 def claim_future(
     tr: fdb.Transaction,
     ss: fdb.Subspace,
-    future: UnclaimedFuture[T],
+    future: Union[UUID, UnclaimedFuture[T]],
     worker_address: str,
     worker_port: int,
+    force: bool = False,
 ) -> ClaimedFuture[T]:
-    """Claim a future for the given worker. If the future is already claimed,
+    """Claim a future for the given worker. If force=True and the future is
+    already claimed,
     that claim is overwritten and invalidated. This also resets the
     num_attempts counter (under the assumption that the new worker may be
     in a better state than the previous worker attempting to work on the
     future -- e.g., more memory)."""
+    future_id = future if isinstance(future, UUID) else future.id
 
-    if not future_exists(tr, ss, future.id):
-        raise FutureDoesNotExistException(future.id)
+    if not future_exists(tr, ss, future_id):
+        raise FutureDoesNotExistException(future_id)
 
-    clear_resource_requirements(tr, ss, future.id, future.resource_requirements)
+    unclaimed_future: Future[T] = get_future_state(tr, ss, future_id)
+    if not force and not isinstance(unclaimed_future, UnclaimedFuture):
+        raise Exception(f"Impossible happened: future {future_id} is not unclaimed")
+
+    clear_resource_requirements(
+        tr, ss, unclaimed_future.id, unclaimed_future.resource_requirements
+    )
     claim = FutureClaim(
         worker_id=WorkerId(worker_address, worker_port),
         claimed_at=seconds_since_epoch(),
     )
-    future_ss = ss.subspace(("future", future.id))
+    future_ss = ss.subspace(("future", future_id))
     tr[future_ss["claim"]] = pickle.dumps(claim)
     return ClaimedFuture(
-        id=future.id,
-        code=future.code,
-        dependencies=future.dependencies,
-        resource_requirements=future.resource_requirements,
-        max_retries=future.max_retries,
+        id=future_id,
+        code=unclaimed_future.code,
+        dependencies=unclaimed_future.dependencies,
+        resource_requirements=unclaimed_future.resource_requirements,
+        max_retries=unclaimed_future.max_retries,
         claim=claim,
         num_attempts=0,
         latest_exception=None,

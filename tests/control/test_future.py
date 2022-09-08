@@ -3,16 +3,17 @@ from typing import Any, Dict, List, Set, Tuple
 import pytest
 import uuid
 from uuid import UUID
-import hypothesis
-import hypothesis.strategies as st
-from hypothesis.database import DirectoryBasedExampleDatabase
-from hypothesis.stateful import (
-    Bundle,
-    RuleBasedStateMachine,
-    rule,
-    run_state_machine_as_test,
-    initialize,
-)
+
+# import hypothesis
+# import hypothesis.strategies as st
+# from hypothesis.database import DirectoryBasedExampleDatabase
+# from hypothesis.stateful import (
+#     Bundle,
+#     RuleBasedStateMachine,
+#     rule,
+#     run_state_machine_as_test,
+#     initialize,
+# )
 
 import fdb_ray_clone.control.future as future
 
@@ -119,7 +120,7 @@ def test_realize_stolen_future(db: fdb.Database, subspace: fdb.Subspace) -> None
     future.claim_future(db, subspace, f, "localhost", 1234)
     f_orig_claim = future.get_future_state(db, subspace, f)
 
-    future.claim_future(db, subspace, f, "localhost", 1235)
+    future.claim_future(db, subspace, f, "localhost", 1235, force=True)
     with pytest.raises(Exception):
         f = future.realize_future(db, subspace, f_orig_claim, "buffername")
 
@@ -163,7 +164,7 @@ def test_fail_stolen_future(db: fdb.Database, subspace: fdb.Subspace) -> None:
     )
     f_orig_claim = future.claim_future(db, subspace, f, "localhost", 1234)
 
-    future.claim_future(db, subspace, f, "localhost", 1235)
+    future.claim_future(db, subspace, f, "localhost", 1235, force=True)
     with pytest.raises(future.ClaimLostException):
         f = future.fail_future(db, subspace, f_orig_claim, Exception("error message"))
 
