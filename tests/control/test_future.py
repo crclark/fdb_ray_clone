@@ -197,6 +197,30 @@ def test_await_future_timeout(db: fdb.Database, subspace: fdb.Subspace) -> None:
     assert future.await_future(db, subspace, f, time_limit_secs=1) is None
 
 
+def test_scan_resource_requirements(db: fdb.Database, subspace: fdb.Subspace) -> None:
+    n = 4
+    futures = [
+        future.submit_future(
+            db,
+            subspace,
+            lambda: 1,
+            [],
+            future.ResourceRequirements(cpu=i, ram=i * 2),
+            id=uuid.uuid4(),
+        )
+        for i in range(1, n + 1)
+    ]
+    available_resources = future.WorkerResources(cpu=3, ram=4, gpu=0)
+    relevant_futures = future.futures_fitting_resources(
+        db, subspace, available_resources
+    )
+
+    assert futures[0].id in relevant_futures
+    assert futures[1].id in relevant_futures
+    assert futures[2].id not in relevant_futures
+    assert futures[3].id not in relevant_futures
+
+
 # TODO: fix the state machine tests -- non-deterministic somehow
 
 # @dataclass

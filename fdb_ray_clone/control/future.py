@@ -9,7 +9,18 @@
 import cloudpickle
 from dataclasses import dataclass
 import pickle
-from typing import Any, Callable, Generic, List, Optional, TypeVar, Union
+from typing import (
+    Any,
+    Callable,
+    Dict,
+    Generic,
+    List,
+    Literal,
+    Optional,
+    Set,
+    TypeVar,
+    Union,
+)
 from uuid import UUID
 import uuid
 import fdb
@@ -269,6 +280,9 @@ class WorkerId:
     port: int
 
 
+Resource = Union[Literal["cpu"], Literal["ram"], Literal["gpu"]]
+
+
 @dataclass(frozen=True)
 class ResourceRequirements:
     cpu: int = 0
@@ -385,6 +399,55 @@ def clear_resource_requirements(
         resource_ss = ss.subspace((f"resource_requirements_{resource}",))
         req = resource_requirements.__getattribute__(resource)
         del tr[resource_ss.pack((req, future_id))]
+
+
+@fdb.transactional
+def scan_resource_requirements(
+    tr: fdb.Transaction, ss: fdb.Subspace, resource: Resource, max_value: int
+) -> Dict[UUID, int]:
+    """Return all resource requirements for the given resource that are less
+    than or equal to max_value. This can be used to find all resource requirements that
+    are less than the available resources on a worker.
+
+    Performed as a snapshot read to reduce spurious conflicts.
+
+    Returns a dict where the keys are future ids and the values are requirements
+    for the given resource."""
+    resource_ss = ss.subspace((f"resource_requirements_{resource}",))
+    end_key = resource_ss.pack((max_value + 1,))
+    ret = dict()
+    for key, _ in tr.snapshot.get_range(resource_ss.range().start, end_key):
+        req, future_id = resource_ss.unpack(key)
+        ret[future_id] = req
+    return ret
+
+
+@fdb.transactional
+def futures_fitting_resources(
+    tr: fdb.Transaction,
+    ss: fdb.Subspace,
+    available_resources: WorkerResources,
+) -> List[UUID]:
+    """Return a list of all futures that fit within the available resources."""
+    ret: Set[UUID] = set()
+    for resource in ["cpu", "ram", "gpu"]:
+        reqs = scan_resource_requirements(
+            tr, ss, resource, available_resources.__getattribute__(resource)
+        )
+        if not ret:
+            ret.update(reqs.keys())
+        else:
+            ret.intersection_update(reqs.keys())
+    return list(ret)
+
+
+# TODO: heartbeat management
+# @fdb.transactional
+# def write_worker_heartbeat(
+#     tr: fdb.Transaction, ss: fdb.Subspace, worker_id: WorkerId, heartbeat: WorkerHeartbeat
+# ) -> None:
+#     worker_ss = ss.subspace((f"worker",))
+#     tr[worker_ss.pack((worker_id, heartbeat.last_heartbeat_at))] = b""
 
 
 @fdb.transactional
