@@ -4,61 +4,9 @@
 
    NOTE: the functions in this interface ONLY transition the FoundationDB state,
    NOT the data plane state. The worker logic is responsible for orchestrating
-   the two."""
+   the two.
 
-from enum import Enum
-import cloudpickle
-from dataclasses import dataclass
-import pickle
-from typing import (
-    Any,
-    Callable,
-    Dict,
-    Generic,
-    List,
-    Literal,
-    NoReturn,
-    Optional,
-    Set,
-    TypeVar,
-    Union,
-)
-from uuid import UUID
-import uuid
-import fdb
-import time
-
-fdb.api_version(710)
-
-T = TypeVar("T")
-
-
-def unpickle(x: "fdb.Value") -> Optional[T]:
-    if not x.present():
-        return None
-    else:
-        result: T = pickle.loads(x.value)
-        return result
-
-
-def must_unpickle(x: "fdb.Value") -> T:
-    if not x.present():
-        raise Exception("Value not present")
-    else:
-        result: T = pickle.loads(x.value)
-        return result
-
-
-class FutureDoesNotExistException(Exception):
-    pass
-
-
-class ClaimLostException(Exception):
-    pass
-
-
-"""
-FDB data model
+   FDB data model
 
 **All subspaces are contained within a subspace scoped by a user-provided
 cluster name.**
@@ -261,9 +209,58 @@ for each current partition:
   delete_future(current_partition)
 
 
-# TODO: API to delete a result without deleting the future?
+# TODO: API to delete a result without deleting the future?"""
 
-"""
+from enum import Enum
+import cloudpickle
+from dataclasses import dataclass
+import pickle
+from typing import (
+    Any,
+    Callable,
+    Dict,
+    Generic,
+    List,
+    Literal,
+    NoReturn,
+    Optional,
+    Set,
+    TypeVar,
+    Union,
+)
+from uuid import UUID
+import uuid
+import fdb
+import time
+
+fdb.api_version(710)
+
+T = TypeVar("T")
+
+
+def unpickle(x: "fdb.Value") -> Optional[T]:
+    if not x.present():
+        return None
+    else:
+        result: T = pickle.loads(x.value)
+        return result
+
+
+def must_unpickle(x: "fdb.Value") -> T:
+    if not x.present():
+        raise Exception("Value not present")
+    else:
+        result: T = pickle.loads(x.value)
+        return result
+
+
+class FutureDoesNotExistException(Exception):
+    pass
+
+
+class ClaimLostException(Exception):
+    pass
+
 
 SecondsSinceEpoch = int
 
@@ -554,7 +551,7 @@ def get_future_state(  # type: ignore [return] # TODO: wtf
     future_id = future if isinstance(future, UUID) else future.id
     future_ss = ss.subspace(("future", future_id))
 
-    # keys we need to be able to decide which case to return (unclaimed, etc.)
+    # keys we need in order to know which case to return (unclaimed, etc.)
     claim = tr[future_ss["claim"]]
     latest_result = tr[future_ss["latest_result"]]
     num_attempts = tr[future_ss["num_attempts"]]
