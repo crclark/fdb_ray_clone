@@ -17,6 +17,7 @@ from typing import (
     Generic,
     List,
     Literal,
+    NoReturn,
     Optional,
     Set,
     TypeVar,
@@ -293,6 +294,11 @@ class FutureClaim:
     claimed_at: SecondsSinceEpoch
 
 
+# TODO: generalize this name to ObjectRef, and create a put_object function
+# that doesn't require a corresponding future. Then get() can be used to get
+# any object, regardless of whether it was created by a future. Document the
+# downside: objects created by futures can be recovered by recomputing the
+# future, objects created by put cannot be recovered.
 @dataclass(frozen=True)
 class FutureResult(Generic[T]):
     timestamp: SecondsSinceEpoch
@@ -302,10 +308,18 @@ class FutureResult(Generic[T]):
 
 @dataclass(frozen=True)
 class FutureException:
-    # optional because some exceptions are not picklable.
-    exception: Optional[Exception]
-    exception_type: type
-    # traceback: Optional[str] # TODO
+    message: str
+
+
+class RemoteException(Exception):
+    def __init__(self, message: str):
+        super().__init__(message)
+        self.message = message
+
+
+def throw_future_exception(exception: FutureException) -> NoReturn:
+    msg = "\n** Traceback from worker **:\n"
+    raise RemoteException(msg + exception.message)
 
 
 # TODO: worker must calculate its available memory as the difference between
@@ -355,7 +369,7 @@ class RealizedFuture(ClaimedFuture[T]):
 
 @dataclass(frozen=True)
 class FailedFuture(ClaimedFuture[T]):
-    pass
+    latest_exception: FutureException
 
 
 # simple algebraic data type equivalent. Copilot even completed this for me.
@@ -365,11 +379,18 @@ Future = Union[UnclaimedFuture[T], ClaimedFuture[T], RealizedFuture[T], FailedFu
 
 @dataclass(frozen=True)
 class FutureFDBWatch(Generic[T]):
-    fdb_watch: fdb.Future
-    key: bytes
+    fdb_success_watch: fdb.Future
+    fdb_failure_watch: fdb.Future
+    result_key: bytes
 
 
-FutureWatch = Union[FutureFDBWatch[T], FutureResult[T]]
+class AwaitFailed(Enum):
+    TimeLimitExceeded = 1
+    WorkerPresumedDead = 2
+    FutureFailed = 3
+
+
+FutureWatch = Union[AwaitFailed, FutureFDBWatch[T], FutureResult[T]]
 
 
 @fdb.transactional
@@ -612,6 +633,31 @@ def get_future_state(  # type: ignore [return] # TODO: wtf
             )
 
 
+@fdb.transactional
+def relinquish_claim(
+    tr: fdb.Transaction, ss: fdb.Subspace, future: ClaimedFuture[T]
+) -> UnclaimedFuture[T]:
+    """Clears the claim for a future, transitioning it back to the unclaimed state
+    so that a worker can claim it again. Fails with an exception if the input
+    claim is not the current claim for the future."""
+
+    future_ss = ss.subspace(("future", future.id))
+    latest_claim = unpickle(tr[future_ss["claim"]].wait())
+    if not latest_claim or latest_claim != future.claim:
+        raise ClaimLostException(
+            f"Cannot relinquish outdated claim. Latest claim is {latest_claim}, but input claim is {future.claim}."
+        )
+    del tr[future_ss["claim"]]
+    write_resource_requirements(tr, ss, future.id, future.resource_requirements)
+    return UnclaimedFuture(
+        id=future.id,
+        code=future.code,
+        dependencies=future.dependencies,
+        resource_requirements=future.resource_requirements,
+        max_retries=future.max_retries,
+    )
+
+
 # pedagogical note: using more precise types to encode valid transitions in
 # the future state machine. Might ultimately be useless, though.
 @fdb.transactional
@@ -636,7 +682,7 @@ def claim_future(
 
     unclaimed_future: Future[T] = get_future_state(tr, ss, future_id)
     if not force and not isinstance(unclaimed_future, UnclaimedFuture):
-        raise Exception(f"Impossible happened: future {future_id} is not unclaimed")
+        raise Exception(f"Future {future_id} is not unclaimed")
 
     clear_resource_requirements(
         tr, ss, unclaimed_future.id, unclaimed_future.resource_requirements
@@ -711,7 +757,7 @@ def fail_future(
     tr: fdb.Transaction,
     ss: fdb.Subspace,
     future: ClaimedFuture[T],
-    exception: Exception,
+    exception_message: str,
 ) -> Union[FailedFuture[T], ClaimedFuture[T]]:
     """Records an exception that occurred while running the future's code, and
        increments num_attempts on the future.
@@ -721,16 +767,7 @@ def fail_future(
     if not future_exists(tr, ss, future.id):
         raise FutureDoesNotExistException(future.id)
 
-    # convert exception to FutureException and store it in the future
-    try:
-        pickle.dumps(exception)
-        future_exception = FutureException(
-            exception=exception, exception_type=exception.__class__
-        )
-    except pickle.PicklingError:
-        future_exception = FutureException(
-            exception=None, exception_type=exception.__class__
-        )
+    future_exception = FutureException(message=exception_message)
     future_ss = ss.subspace(("future", future.id))
     latest_claim = unpickle(tr[future_ss["claim"]].wait())
     if not latest_claim or latest_claim != future.claim:
@@ -742,7 +779,7 @@ def fail_future(
     # TODO: blind writes are brittle
     tr[future_ss["num_attempts"]] = pickle.dumps(future.num_attempts + 1)
 
-    if future.num_attempts + 1 >= future.max_retries:
+    if future.num_attempts >= future.max_retries + 1:
         return FailedFuture(
             id=future.id,
             code=future.code,
@@ -774,18 +811,28 @@ def _create_future_watch(
     after the transaction has been committed."""
     future_ss = ss.subspace(("future", future.id))
     result: Optional[FutureResult[T]] = unpickle(tr[future_ss["latest_result"]].wait())
+    exception: Optional[FutureException] = unpickle(
+        tr[future_ss["latest_exception"]].wait()
+    )
     if result:
         return result
+    elif exception:
+        return AwaitFailed.FutureFailed
     else:
-        key = future_ss.pack(("latest_result",))
-        return FutureFDBWatch(fdb_watch=tr.watch(key), key=key)
+        success_key = future_ss["latest_result"]
+        failure_key = future_ss["latest_exception"]
+        return FutureFDBWatch(
+            fdb_success_watch=tr.watch(success_key),
+            fdb_failure_watch=tr.watch(failure_key),
+            result_key=success_key,
+        )
 
 
 @fdb.transactional
 def _get_future_watch_result(
     tr: fdb.Transaction, future_watch: FutureFDBWatch[T]
 ) -> FutureResult[T]:
-    result: Optional[FutureResult[T]] = unpickle(tr.get(future_watch.key).wait())
+    result: Optional[FutureResult[T]] = unpickle(tr.get(future_watch.result_key).wait())
     if result:
         return result
     else:
@@ -813,11 +860,6 @@ def _future_worker_latest_heartbeat(
         return None
 
 
-class AwaitFailed(Enum):
-    TimeLimitExceeded = 1
-    WorkerPresumedDead = 2
-
-
 def _await_future_watch(
     db: fdb.Database,
     ss: fdb.Subspace,
@@ -827,7 +869,6 @@ def _await_future_watch(
     presume_worker_dead_after_secs: Optional[int] = None,
 ) -> Union[AwaitFailed, FutureResult[T]]:
     """Blocks until the future has been realized and returns its result. If time limit is exceeded, returns None."""
-    print(f"Awaiting future watch... {presume_worker_dead_after_secs}")
     if isinstance(future_watch, FutureFDBWatch):
         started_at = seconds_since_epoch()
         last_worker_heartbeat_at = None
@@ -835,9 +876,11 @@ def _await_future_watch(
         max_poll_wait = 16
         while True:
             wait_duration = seconds_since_epoch() - started_at
-            if future_watch.fdb_watch.is_ready():
+            if future_watch.fdb_success_watch.is_ready():
                 result: FutureResult[T] = _get_future_watch_result(db, future_watch)
                 return result
+            elif future_watch.fdb_failure_watch.is_ready():
+                return AwaitFailed.FutureFailed
             elif time_limit_secs is not None and wait_duration > time_limit_secs:
                 return AwaitFailed.TimeLimitExceeded
             elif (
@@ -847,7 +890,6 @@ def _await_future_watch(
                 last_worker_heartbeat_at = _future_worker_latest_heartbeat(
                     db, ss, future_id
                 )
-                print(f"Worker last heartbeat at {last_worker_heartbeat_at}")
                 if (
                     last_worker_heartbeat_at is not None
                     and seconds_since_epoch() - last_worker_heartbeat_at

@@ -17,6 +17,7 @@ and then have the worker busy loop and see if the store still responds to reques
 
 import fdb_ray_clone.control.future as future
 from fdb_ray_clone.data.store import StoreServer, StoreClient
+import fdb_ray_clone.client as client
 
 import argparse
 import logging
@@ -25,6 +26,8 @@ import random
 from multiprocessing import Process
 from dataclasses import dataclass
 import pickle
+import sys
+import traceback
 from typing import (
     Any,
     Callable,
@@ -56,20 +59,27 @@ class WorkerConfig:
     max_gpu: int
 
 
+class MaxRetriesExceededException(Exception):
+    pass
+
+
 def _report_failure(
-    config: WorkerConfig, f: future.Future[T], e: Exception
+    config: WorkerConfig,
+    f: future.Future[T],
+    exception_message: str,
 ) -> Union[future.FailedFuture[T], future.ClaimedFuture[T]]:
-    logging.exception(f"Failed to process future {f} because of exception {e}")
+    logging.exception(
+        f"Failed to process future {f} because of exception {exception_message}"
+    )
     try:
         fail_result: Union[
             future.FailedFuture[T], future.ClaimedFuture[T]
-        ] = future.fail_future(config.db, config.ss, f, e)
+        ] = future.fail_future(config.db, config.ss, f, exception_message)
         return fail_result
     except Exception as e:
         logging.exception(
             f"Failed to report failure of future {f} because of exception {e}"
         )
-        # TODO: this will kill the worker. Add more catches to prevent that.
         raise e
 
 
@@ -80,9 +90,13 @@ def _work_on_future_with_retries(config: WorkerConfig, f: future.Future[T]) -> T
             if not config.store.can_store(result):
                 raise Exception(f"Result {result} is not picklable.")
         except Exception as e:
-            f = _report_failure(config, f, e)
+            exception_type, error, tb = sys.exc_info()
+            error_lines = traceback.format_exception(exception_type, error, tb)
+            exception_msg = "\n".join(error_lines)
+            f = _report_failure(config, f, exception_msg)
             if isinstance(f, future.FailedFuture):
-                raise e
+                raise MaxRetriesExceededException
+            continue
         return result
 
 
@@ -140,11 +154,13 @@ def _process_one_future(config: WorkerConfig) -> None:
 def worker_loop(
     worker_id: future.WorkerId,
     subspace: fdb.Subspace,
+    cluster_name: str,
     max_cpu: int,
     max_ram: int,
     max_gpu: int,
 ) -> None:
     db = fdb.open()
+    client.init(cluster_name)
     with StoreServer(bind_address=worker_id.address, bind_port=worker_id.port) as store:
         config = WorkerConfig(
             worker_id=worker_id,
@@ -158,6 +174,8 @@ def worker_loop(
         while True:
             try:
                 _process_one_future(config)
+            except MaxRetriesExceededException:
+                continue
             except Exception as e:
                 logging.exception(
                     f"Caught unexpected exception {e} while processing future. Abandoning this future and trying another. This is probably a bug in fdb_ray_clone."
@@ -167,6 +185,7 @@ def worker_loop(
 def main(
     worker_id: future.WorkerId,
     subspace: fdb.Subspace,
+    cluster_name: str,
     max_cpu: int,
     max_ram: int,
     max_gpu: int,
@@ -177,6 +196,7 @@ def main(
         args=(
             worker_id,
             subspace,
+            cluster_name,
             max_cpu,
             max_ram,
             max_gpu,
@@ -224,7 +244,7 @@ if __name__ == "__main__":
         "--port", type=int, help="port on which to serve the store", default=50001
     )
     parser.add_argument(
-        "--cluster_name",
+        "cluster_name",
         help="namespace in which to store futures. Must be the same on all workers and clients.",
     )
     parser.add_argument(
@@ -249,6 +269,7 @@ if __name__ == "__main__":
     main(
         future.WorkerId(args.address, args.port),
         fdb.Subspace(("fdb_ray_clone", args.cluster_name)),
+        args.cluster_name,
         args.max_cpu,
         args.max_ram,
         args.max_gpu,

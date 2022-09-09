@@ -81,6 +81,19 @@ def test_claim_future(db: fdb.Database, subspace: fdb.Subspace) -> None:
     assert get_claim_ret.worker_id.port == 1234
 
 
+def test_relinquish_claim(db: fdb.Database, subspace: fdb.Subspace) -> None:
+    f = future.submit_future(
+        db, subspace, lambda x, y: x + y, [1, 2], future.ResourceRequirements()
+    )
+
+    f = future.claim_future(db, subspace, f, "localhost", 1234)
+
+    f_relinquish_result = future.relinquish_claim(db, subspace, f)
+    f_after_relinquish = future.get_future_state(db, subspace, f)
+
+    assert isinstance(f_after_relinquish, future.UnclaimedFuture)
+
+
 def test_claim_nonexistent_future(
     db: fdb.Database,
     subspace: fdb.Subspace,
@@ -145,12 +158,12 @@ def test_fail_future(db: fdb.Database, subspace: fdb.Subspace) -> None:
     )
     f = future.claim_future(db, subspace, f, "localhost", 1234)
 
-    f = future.fail_future(db, subspace, f, Exception("error message"))
+    f = future.fail_future(db, subspace, f, "error message")
     f = future.get_future_state(db, subspace, f)
 
     assert isinstance(f, future.FailedFuture)
     assert f.latest_exception is not None
-    assert f.latest_exception.exception.__str__() == "error message"
+    assert f.latest_exception.message == "error message"
 
 
 def test_fail_stolen_future(db: fdb.Database, subspace: fdb.Subspace) -> None:
@@ -166,7 +179,7 @@ def test_fail_stolen_future(db: fdb.Database, subspace: fdb.Subspace) -> None:
 
     future.claim_future(db, subspace, f, "localhost", 1235, force=True)
     with pytest.raises(future.ClaimLostException):
-        f = future.fail_future(db, subspace, f_orig_claim, Exception("error message"))
+        f = future.fail_future(db, subspace, f_orig_claim, "error message")
 
 
 def test_fail_nonexistent_future(
@@ -175,9 +188,7 @@ def test_fail_nonexistent_future(
     nonexistent_future: future.UnclaimedFuture[int],
 ) -> None:
     with pytest.raises(future.FutureDoesNotExistException):
-        f = future.fail_future(
-            db, subspace, nonexistent_future, Exception("error message")
-        )
+        f = future.fail_future(db, subspace, nonexistent_future, "error message")
 
 
 def test_await_future(db: fdb.Database, subspace: fdb.Subspace) -> None:
@@ -202,6 +213,21 @@ def test_await_future_timeout(db: fdb.Database, subspace: fdb.Subspace) -> None:
         future.await_future(db, subspace, f, time_limit_secs=1)
         == future.AwaitFailed.TimeLimitExceeded
     )
+
+
+def test_await_future_exception(db: fdb.Database, subspace: fdb.Subspace) -> None:
+    f = future.submit_future(
+        db,
+        subspace,
+        lambda x, y: x + y,
+        [1, 2],
+        future.ResourceRequirements(),
+        max_retries=0,
+    )
+    f = future.claim_future(db, subspace, f, "localhost", 1234)
+    f = future.fail_future(db, subspace, f, "error message")
+
+    assert future.await_future(db, subspace, f) == future.AwaitFailed.FutureFailed
 
 
 def test_await_future_dead_worker(db: fdb.Database, subspace: fdb.Subspace) -> None:
