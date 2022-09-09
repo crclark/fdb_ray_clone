@@ -59,6 +59,22 @@ class Client(object):
             )
         return self.clients[worker_id]
 
+    @fdb.transactional
+    def _attempt_resubmit(self, tr: fdb.Transaction, f: Future[T]) -> bool:
+        """Attempt to resubmit a future that has failed.
+
+        Returns True if the future was successfully resubmitted, False if the
+        future was already claimed by another worker.
+        """
+        f = future.get_future_state(tr, self.ss, f._future)
+        match f:
+            case future.ClaimedFuture():
+                future.relinquish_claim(self.db, self.ss, f._future)
+                return True
+            case _:
+                # Someone else already fixed the problem; we're done.
+                return False
+
     def await_future(
         self,
         f: Future[T],
@@ -75,7 +91,7 @@ class Client(object):
                 logging.warning(
                     "Worker responsible for this future died; attempting to resubmit and await again."
                 )
-                future.relinquish_claim(self.db, self.ss, f._future)
+                self._attempt_resubmit(self.db, f)
                 # TODO: this is resetting our time limits. Should it?
                 return self.await_future(
                     f, time_limit_secs, presume_worker_dead_after_secs

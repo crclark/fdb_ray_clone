@@ -43,6 +43,7 @@ def nonexistent_future() -> future.UnclaimedFuture[int]:
         resource_requirements=future.ResourceRequirements(),
         max_retries=3,
         id=UUID("00000000-0000-0000-0000-000000000000"),
+        num_attempts=0,
     )
 
 
@@ -74,6 +75,10 @@ def test_claim_future(db: fdb.Database, subspace: fdb.Subspace) -> None:
 
     assert f_claim_ret.claim == f_claim_state.claim == get_claim_ret
 
+    future_id = future.get_worker_claim_future(
+        db, subspace, future.WorkerId("localhost", 1234)
+    )
+    assert future_id == f.id
     assert isinstance(f_claim_state, future.ClaimedFuture)
     assert f_claim_state.claim.worker_id.address == "localhost"
     assert f_claim_state.claim.worker_id.port == 1234
@@ -92,6 +97,11 @@ def test_relinquish_claim(db: fdb.Database, subspace: fdb.Subspace) -> None:
     f_after_relinquish = future.get_future_state(db, subspace, f)
 
     assert isinstance(f_after_relinquish, future.UnclaimedFuture)
+
+    future_id = future.get_worker_claim_future(
+        db, subspace, future.WorkerId("localhost", 1234)
+    )
+    assert future_id is None
 
 
 def test_claim_nonexistent_future(
@@ -124,6 +134,11 @@ def test_realize_future(db: fdb.Database, subspace: fdb.Subspace) -> None:
     assert f.latest_result.worker_id.address == "localhost"
     assert f.latest_result.worker_id.port == 1234
     assert f.latest_result.name == "buffername"
+
+    future_id = future.get_worker_claim_future(
+        db, subspace, future.WorkerId("localhost", 1234)
+    )
+    assert future_id is None
 
 
 def test_realize_stolen_future(db: fdb.Database, subspace: fdb.Subspace) -> None:
@@ -159,11 +174,17 @@ def test_fail_future(db: fdb.Database, subspace: fdb.Subspace) -> None:
     f = future.claim_future(db, subspace, f, "localhost", 1234)
 
     f = future.fail_future(db, subspace, f, "error message")
+    assert isinstance(f, future.FailedFuture)
     f = future.get_future_state(db, subspace, f)
-
+    # breakpoint()
     assert isinstance(f, future.FailedFuture)
     assert f.latest_exception is not None
     assert f.latest_exception.message == "error message"
+
+    future_id = future.get_worker_claim_future(
+        db, subspace, future.WorkerId("localhost", 1234)
+    )
+    assert future_id is None
 
 
 def test_fail_stolen_future(db: fdb.Database, subspace: fdb.Subspace) -> None:

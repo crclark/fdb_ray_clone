@@ -136,11 +136,15 @@ though it may no longer contain the realized futures it used to.
 
 ## Key/values per worker:
 
-- key (`worker_ip`, `worker_port`): value: pickled WorkerHeartbeat object. This
+- key (`worker_ip`, `worker_port`, "heartbeat"): value: pickled WorkerHeartbeat object. This
   contains the timestamp of the worker's last heartbeat, the timestamp at which
   the worker started up, and the worker's
   available resources (CPU is constant, RAM is adjusted to account for free space,
   since the worker is storing future results).
+- key (`worker_ip`, `worker_port`, "claim_future"): value: pickled future UUID
+  indicating the future the worker is currently working on. This is kept in sync
+  with the claim key in the futures subspace. If this key is not present, the
+  worker is not currently working on a future.
 
 # Error handling and failure modes
 
@@ -349,23 +353,39 @@ class BaseFuture(Generic[T]):
 
 @dataclass(frozen=True)
 class UnclaimedFuture(BaseFuture[T]):
+    """A newly-submitted future that is not claimed by a worker. It could have
+    been claimed in the past, though, so num_attempts could be non-zero."""
+
+    num_attempts: int
+
     pass
 
 
 @dataclass(frozen=True)
 class ClaimedFuture(BaseFuture[T]):
+    """A future which a worker has claimed for exclusive access to compute its
+    result."""
+
     claim: FutureClaim
     num_attempts: int
     latest_exception: Optional[FutureException]
 
 
 @dataclass(frozen=True)
-class RealizedFuture(ClaimedFuture[T]):
+class RealizedFuture(BaseFuture[T]):
+    """A future for which a result has been successfully computed.
+    The claim key is cleared because it is no longer being worked on."""
+
+    num_attempts: int
+    latest_exception: Optional[FutureException]
     latest_result: FutureResult[T]
 
 
 @dataclass(frozen=True)
-class FailedFuture(ClaimedFuture[T]):
+class FailedFuture(BaseFuture[T]):
+    """A future that was previously claimed, but exceeded its max retries."""
+
+    num_attempts: int
     latest_exception: FutureException
 
 
@@ -457,6 +477,40 @@ def futures_fitting_resources(
 
 
 @fdb.transactional
+def _set_worker_claim_future(
+    tr: fdb.Transaction,
+    ss: fdb.Subspace,
+    worker_id: WorkerId,
+    future_id: UUID,
+) -> None:
+    worker_ss = ss.subspace((f"workers",))
+    tr[worker_ss[worker_id.address][worker_id.port]["claim_future"]] = pickle.dumps(
+        future_id
+    )
+
+
+@fdb.transactional
+def _clear_worker_claim_future(
+    tr: fdb.Transaction,
+    ss: fdb.Subspace,
+    worker_id: WorkerId,
+) -> None:
+    worker_ss = ss.subspace((f"workers",))
+    del tr[worker_ss[worker_id.address][worker_id.port]["claim_future"]]
+
+
+@fdb.transactional
+def get_worker_claim_future(
+    tr: fdb.Transaction, ss: fdb.Subspace, worker_id: WorkerId
+) -> Optional[UUID]:
+    """Returns the UUID of the future that the given worker currently has a claim on."""
+    worker_ss = ss.subspace((f"workers",))
+    return unpickle(
+        tr[worker_ss[worker_id.address][worker_id.port]["claim_future"]].wait()
+    )
+
+
+@fdb.transactional
 def write_worker_heartbeat(
     tr: fdb.Transaction,
     ss: fdb.Subspace,
@@ -466,7 +520,9 @@ def write_worker_heartbeat(
     worker_ss = ss.subspace((f"workers",))
     # Reading a somewhat stale heartbeat is okay.
     tr.options.set_next_write_no_write_conflict_range()
-    tr[worker_ss.pack((worker_id.address, worker_id.port))] = pickle.dumps(heartbeat)
+    tr[worker_ss.pack((worker_id.address, worker_id.port, "heartbeat"))] = pickle.dumps(
+        heartbeat
+    )
 
 
 @fdb.transactional
@@ -476,7 +532,7 @@ def get_worker_heartbeat(
     worker_id: WorkerId,
 ) -> Optional[WorkerHeartbeat]:
     worker_ss = ss.subspace((f"workers",))
-    val = tr[worker_ss.pack((worker_id.address, worker_id.port))]
+    val = tr[worker_ss.pack((worker_id.address, worker_id.port, "heartbeat"))]
     return unpickle(val)
 
 
@@ -488,9 +544,11 @@ def all_worker_heartbeats(
     worker_ss = ss.subspace((f"workers",))
     ret: Dict[WorkerId, WorkerHeartbeat] = dict()
     for key, val in tr.get_range(worker_ss.range().start, worker_ss.range().stop):
-        worker_id = WorkerId(*worker_ss.unpack(key))
-        heartbeat: WorkerHeartbeat = pickle.loads(val)
-        ret[worker_id] = heartbeat
+        match worker_ss.unpack(key):
+            case [address, port, "heartbeat"]:
+                ret[WorkerId(address, port)] = pickle.loads(val)
+            case _:
+                continue  # ignore non-heartbeat keys
     return ret
 
 
@@ -513,6 +571,7 @@ def submit_future(
         dependencies=dependencies,
         resource_requirements=resource_requirements,
         max_retries=max_retries,
+        num_attempts=0,
     )
     future_ss = ss.subspace(("future", id))
     tr[future_ss.pack(("code",))] = cloudpickle.dumps(future_code)
@@ -576,16 +635,8 @@ def get_future_state(  # type: ignore [return] # TODO: wtf
         num_attempts,
         max_retries,
     ):
-        case (None, _, _, max_retries):
-            return UnclaimedFuture(
-                id=future_id,
-                code=must_unpickle(code.wait()),
-                dependencies=must_unpickle(dependencies.wait()),
-                resource_requirements=must_unpickle(resource_requirements.wait()),
-                max_retries=max_retries,
-            )
         case (
-            claim,
+            None,
             None,
             num_attempts,
             max_retries,
@@ -596,12 +647,20 @@ def get_future_state(  # type: ignore [return] # TODO: wtf
                 dependencies=must_unpickle(dependencies.wait()),
                 resource_requirements=must_unpickle(resource_requirements.wait()),
                 max_retries=max_retries,
-                claim=claim,
                 num_attempts=num_attempts,
                 latest_exception=must_unpickle(latest_exception.wait()),
             )
+        case (None, None, num_attempts, max_retries):
+            return UnclaimedFuture(
+                id=future_id,
+                code=must_unpickle(code.wait()),
+                dependencies=must_unpickle(dependencies.wait()),
+                resource_requirements=must_unpickle(resource_requirements.wait()),
+                max_retries=max_retries,
+                num_attempts=num_attempts,
+            )
 
-        case (claim, None, num_attempts, max_retries):
+        case (FutureClaim(), None, num_attempts, max_retries):
             return ClaimedFuture(
                 id=future_id,
                 code=must_unpickle(code.wait()),
@@ -609,17 +668,16 @@ def get_future_state(  # type: ignore [return] # TODO: wtf
                 resource_requirements=must_unpickle(resource_requirements.wait()),
                 max_retries=max_retries,
                 claim=claim,
-                num_attempts=num_attempts or 0,
+                num_attempts=num_attempts,
                 latest_exception=unpickle(latest_exception.wait()),
             )
-        case (claim, latest_result, num_attempts, max_retries):
+        case (None, FutureResult(), num_attempts, max_retries):
             return RealizedFuture(
                 id=future_id,
                 code=must_unpickle(code.wait()),
                 dependencies=must_unpickle(dependencies.wait()),
                 resource_requirements=must_unpickle(resource_requirements.wait()),
                 max_retries=max_retries,
-                claim=claim,
                 num_attempts=num_attempts,
                 latest_result=latest_result,
                 latest_exception=unpickle(latest_exception.wait()),
@@ -630,6 +688,8 @@ def get_future_state(  # type: ignore [return] # TODO: wtf
             )
 
 
+# TODO: we also need a more general resubmit_future that can transition a future
+# from any state to unclaimed, in case an object has been lost by worker death.
 @fdb.transactional
 def relinquish_claim(
     tr: fdb.Transaction, ss: fdb.Subspace, future: ClaimedFuture[T]
@@ -645,6 +705,7 @@ def relinquish_claim(
             f"Cannot relinquish outdated claim. Latest claim is {latest_claim}, but input claim is {future.claim}."
         )
     del tr[future_ss["claim"]]
+    _clear_worker_claim_future(tr, ss, future.claim.worker_id)
     write_resource_requirements(tr, ss, future.id, future.resource_requirements)
     return UnclaimedFuture(
         id=future.id,
@@ -652,6 +713,7 @@ def relinquish_claim(
         dependencies=future.dependencies,
         resource_requirements=future.resource_requirements,
         max_retries=future.max_retries,
+        num_attempts=future.num_attempts,
     )
 
 
@@ -679,13 +741,15 @@ def claim_future(
 
     unclaimed_future: Future[T] = get_future_state(tr, ss, future_id)
     if not force and not isinstance(unclaimed_future, UnclaimedFuture):
-        raise Exception(f"Future {future_id} is not unclaimed")
+        raise Exception(f"Future {future_id} is not unclaimed: {unclaimed_future}")
 
     clear_resource_requirements(
         tr, ss, unclaimed_future.id, unclaimed_future.resource_requirements
     )
+    worker_id = WorkerId(worker_address, worker_port)
+    _set_worker_claim_future(tr, ss, worker_id, future_id)
     claim = FutureClaim(
-        worker_id=WorkerId(worker_address, worker_port),
+        worker_id=worker_id,
         claimed_at=seconds_since_epoch(),
     )
     future_ss = ss.subspace(("future", future_id))
@@ -736,13 +800,14 @@ def realize_future(
     tr[future_ss["latest_result"]] = pickle.dumps(future_result)
     # TODO: blind writes are brittle
     tr[future_ss["num_attempts"]] = pickle.dumps(future.num_attempts + 1)
+    _clear_worker_claim_future(tr, ss, future.claim.worker_id)
+    del tr[future_ss["claim"]]
     return RealizedFuture(
         id=future.id,
         code=future.code,
         dependencies=future.dependencies,
         resource_requirements=future.resource_requirements,
         max_retries=future.max_retries,
-        claim=future.claim,
         num_attempts=future.num_attempts + 1,
         latest_result=future_result,
         latest_exception=latest_exception,
@@ -776,14 +841,16 @@ def fail_future(
     # TODO: blind writes are brittle
     tr[future_ss["num_attempts"]] = pickle.dumps(future.num_attempts + 1)
 
-    if future.num_attempts >= future.max_retries + 1:
+    if future.num_attempts >= future.max_retries:
+        # clear the claim and return failure object.
+        _clear_worker_claim_future(tr, ss, future.claim.worker_id)
+        del tr[future_ss["claim"]]
         return FailedFuture(
             id=future.id,
             code=future.code,
             dependencies=future.dependencies,
             resource_requirements=future.resource_requirements,
             max_retries=future.max_retries,
-            claim=future.claim,
             num_attempts=future.num_attempts + 1,
             latest_exception=future_exception,
         )

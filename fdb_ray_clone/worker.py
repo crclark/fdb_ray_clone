@@ -27,6 +27,8 @@ from multiprocessing import Process
 from dataclasses import dataclass
 import pickle
 import sys
+import signal
+import os
 import traceback
 from typing import (
     Any,
@@ -61,6 +63,18 @@ class WorkerConfig:
 
 class MaxRetriesExceededException(Exception):
     pass
+
+
+@fdb.transactional
+def _relinquish_old_claim(tr: fdb.Transaction, config: WorkerConfig) -> None:
+    """Clean up any claim we may have already, in case we died while processing a future."""
+    claimed_future_id = future.get_worker_claim_future(tr, config.ss, config.worker_id)
+    if claimed_future_id is not None:
+        logging.info(
+            f"found pre-existing claimed future for this worker: {claimed_future_id}. Relinquishing claim."
+        )
+        f = future.get_future_state(tr, config.ss, claimed_future_id)
+        future.relinquish_claim(tr, config.ss, f)
 
 
 def _report_failure(
@@ -151,71 +165,35 @@ def _process_one_future(config: WorkerConfig) -> None:
         _realize_future(config, f, buffer_name)
 
 
-def worker_loop(
+# https://stackoverflow.com/a/20186516
+def _pid_exists(pid: int) -> bool:
+    if pid < 0:
+        return False  # NOTE: pid == 0 returns True
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:  # errno.ESRCH
+        return False  # No such process
+    except PermissionError:  # errno.EPERM
+        return True  # Operation not permitted (i.e., process exists)
+    else:
+        return True  # no error, we can send a signal to the process
+
+
+def heartbeat_loop(
     worker_id: future.WorkerId,
+    worker_pid: int,
     subspace: fdb.Subspace,
     cluster_name: str,
     max_cpu: int,
     max_ram: int,
     max_gpu: int,
+    started_at: int,
 ) -> None:
-    db = fdb.open()
-    client.init(cluster_name)
-    with StoreServer(bind_address=worker_id.address, bind_port=worker_id.port) as store:
-        config = WorkerConfig(
-            worker_id=worker_id,
-            db=db,
-            ss=subspace,
-            store=store,
-            max_cpu=max_cpu,
-            max_ram=max_ram,
-            max_gpu=max_gpu,
-        )
-        while True:
-            try:
-                _process_one_future(config)
-            except MaxRetriesExceededException:
-                continue
-            except Exception as e:
-                logging.exception(
-                    f"Caught unexpected exception {e} while processing future. Abandoning this future and trying another. This is probably a bug in fdb_ray_clone."
-                )
-
-
-def main(
-    worker_id: future.WorkerId,
-    subspace: fdb.Subspace,
-    cluster_name: str,
-    max_cpu: int,
-    max_ram: int,
-    max_gpu: int,
-) -> None:
-    logging.basicConfig(level=logging.INFO)
-    worker = Process(
-        target=worker_loop,
-        args=(
-            worker_id,
-            subspace,
-            cluster_name,
-            max_cpu,
-            max_ram,
-            max_gpu,
-        ),
-    )
-
-    started_at = future.seconds_since_epoch()
-    worker.start()
-
-    # TODO: find a better way to avoid a race with the startup of the
-    # SharedMemoryManager. If we are too fast, StoreClient fails to start up
-    # below (connection refused). Can probably use a multiprocessing queue to
-    # wait for a ready signal from the worker.
-    time.sleep(5)
     db = fdb.open()
     store_client = StoreClient(worker_id.address, worker_id.port)
     while True:
         time.sleep(5)
-        if worker.is_alive():
+        if _pid_exists(worker_pid):
             try:
                 current_resources = future.WorkerResources(
                     cpu=max_cpu,
@@ -231,8 +209,76 @@ def main(
             except Exception as e:
                 logging.exception(f"Failed to write heartbeat because of exception {e}")
         else:
-            logging.error("Worker died. Exiting.")
+            logging.error("Worker died. Heartbeat monitor exiting.")
             break
+
+
+def worker_loop(
+    worker_id: future.WorkerId,
+    subspace: fdb.Subspace,
+    cluster_name: str,
+    max_cpu: int,
+    max_ram: int,
+    max_gpu: int,
+    db: fdb.Database,
+    store: StoreServer,
+) -> None:
+    client.init(cluster_name)
+    config = WorkerConfig(
+        worker_id=worker_id,
+        db=db,
+        ss=subspace,
+        store=store,
+        max_cpu=max_cpu,
+        max_ram=max_ram,
+        max_gpu=max_gpu,
+    )
+    _relinquish_old_claim(db, config)
+    while True:
+        try:
+            _process_one_future(config)
+        except MaxRetriesExceededException:
+            continue
+        except Exception as e:
+            logging.exception(
+                f"Caught unexpected exception {e} while processing future. Abandoning this future and trying another. This is probably a bug in fdb_ray_clone."
+            )
+
+
+def main(
+    worker_id: future.WorkerId,
+    subspace: fdb.Subspace,
+    cluster_name: str,
+    max_cpu: int,
+    max_ram: int,
+    max_gpu: int,
+) -> None:
+    logging.basicConfig(level=logging.INFO)
+
+    db = fdb.open()
+    with StoreServer(bind_address=worker_id.address, bind_port=worker_id.port) as store:
+        heartbeat_worker = Process(
+            target=heartbeat_loop,
+            args=(
+                worker_id,
+                os.getpid(),
+                subspace,
+                cluster_name,
+                max_cpu,
+                max_ram,
+                max_gpu,
+                future.seconds_since_epoch(),
+            ),
+        )
+        heartbeat_worker.start()
+        try:
+            worker_loop(
+                worker_id, subspace, cluster_name, max_cpu, max_ram, max_gpu, db, store
+            )
+        except KeyboardInterrupt:
+            logging.info("Caught KeyboardInterrupt. Exiting.")
+            heartbeat_worker.terminate()
+            sys.exit(0)
 
 
 if __name__ == "__main__":

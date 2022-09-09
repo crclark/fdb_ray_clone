@@ -74,6 +74,5 @@ stateDiagram-v2
 
 # High-priority TODOs
 
-- If a worker dies temporarily and comes back up, the future it is working on will be stuck forever because the worker death logic on the client won't trigger. Need to add a concept of current worker future so the worker can check if it has any work in progress when it comes back up. To be safe, it should simply relinquish that future, just in case it came back up with different resources than when it crashed and can no longer actually fulfill the future.
 - Implement a general put(). See TODO on FutureResult class.
 - Implement actors. Method calls on actors could be futures with locality constraints. Actors themselves could either be stored in buffers and deserialized/reserialized on every call (easier, but limiting), or stored separately in the Store.
