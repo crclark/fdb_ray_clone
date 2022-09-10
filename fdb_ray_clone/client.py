@@ -12,7 +12,7 @@ from typing import (
 )
 from dataclasses import dataclass
 import logging
-
+import multiprocessing.managers
 
 import fdb_ray_clone.control.future as future
 import fdb_ray_clone.data.store as store
@@ -27,6 +27,10 @@ T = TypeVar("T")
 @dataclass(frozen=True)
 class Future(Generic[T]):
     _future: future.Future[T]
+
+
+class WorkerDiedException(Exception):
+    pass
 
 
 # TODO: how does the code within futures get access to a client? We might need
@@ -75,19 +79,43 @@ class Client(object):
                 # Someone else already fixed the problem; we're done.
                 return False
 
-    def await_future(
+    def _resubmit_bad_object_ref(
+        self, tr: fdb.Transaction, f: Future[T], object_ref: future.ObjectRef[T]
+    ) -> None:
+        """Resubmit a future that has failed due to a bad object ref."""
+        future.resubmit_realized_future_bad_object_ref(
+            tr, self.ss, f._future.id, object_ref
+        )
+
+    def await_future(  # type: ignore [return] # TODO: mypy false positive?
         self,
         f: Future[T],
         time_limit_secs: Optional[int] = None,
         presume_worker_dead_after_secs: int = 30,
+        allow_resubmit: bool = True,
     ) -> T:
+        """Wait for a future to complete and return its result.
+
+        Keyword arguments:
+         time_limit_secs -- If set, raise an exception if the future is not
+             completed within this many seconds.
+         presume_worker_dead_after_secs -- If set, assume that the worker
+             fulfilling this future is
+             dead if it has not updated its heartbeat in this many seconds.
+             If this occurs, the future will either be resubmitted for
+             computation by another worker, or an exception will be raised,
+             depending on allow_resubmit is True.
+         allow_resubmit -- If True, resubmit the future for computation if
+             the worker fulfilling it is presumed dead. If False, raise an
+             exception if the worker is presumed dead.
+        """
         result = future.await_future(
             self.db, self.ss, f._future, time_limit_secs, presume_worker_dead_after_secs
         )
         match result:
             case future.AwaitFailed.TimeLimitExceeded:
                 raise TimeoutError("Time limit exceeded")
-            case future.AwaitFailed.WorkerPresumedDead:
+            case future.AwaitFailed.WorkerPresumedDead if allow_resubmit:
                 logging.warning(
                     "Worker responsible for this future died; attempting to resubmit and await again."
                 )
@@ -96,6 +124,8 @@ class Client(object):
                 return self.await_future(
                     f, time_limit_secs, presume_worker_dead_after_secs
                 )
+            case future.AwaitFailed.WorkerPresumedDead if not allow_resubmit:
+                raise WorkerDiedException()
             case future.AwaitFailed.FutureFailed:
                 f = future.get_future_state(self.db, self.ss, f._future)
                 match f:
@@ -103,10 +133,29 @@ class Client(object):
                         future.throw_future_exception(e)
                     case _:
                         raise Exception("Future failed with unknown exception.")
-            case future.FutureResult(worker_id=worker_id, name=name):
+            case future.ObjectRef(worker_id=worker_id, name=name) as object_ref:
                 client = self._get_or_create_client(worker_id)
-                get_result: T = client.get(name)
-                return get_result
+                # TODO: this can throw various exceptions if the worker is dead.
+                # ConnectionRefusedError, timeouts, etc.
+                try:
+                    get_result: T = client.get(name)
+                    return get_result
+                except multiprocessing.managers.RemoteError:
+                    # The remote store no longer has the object, which means
+                    # the worker died and restarted. The future needs to be
+                    # resubmitted.
+                    if allow_resubmit:
+                        logging.warning(
+                            "Worker responsible for this future died; attempting to resubmit and await again."
+                        )
+                        # The worker died and restarted and no longer has the result
+                        # in its store. We need to resubmit the future.
+                        self._resubmit_bad_object_ref(self.db, f, object_ref)
+                        return self.await_future(
+                            f, time_limit_secs, presume_worker_dead_after_secs
+                        )
+                    else:
+                        raise WorkerDiedException()
 
 
 GLOBAL_CLIENT = None

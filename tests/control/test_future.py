@@ -358,6 +358,28 @@ def test_all_worker_heartbeats(db: fdb.Database, subspace: fdb.Subspace) -> None
         assert heartbeats[worker_id] == heartbeat
 
 
+def test_resubmit_realized_future_bad_object_ref(
+    db: fdb.Database, subspace: fdb.Subspace
+) -> None:
+    f = future.submit_future(db, subspace, lambda: 1, [], future.ResourceRequirements())
+    f = future.claim_future(db, subspace, f, "localhost", 1234)
+    f = future.realize_future(db, subspace, f, "buffername")
+
+    object_ref = f.latest_result
+
+    assert future.resubmit_realized_future_bad_object_ref(
+        db, subspace, f.id, object_ref
+    )
+
+    f = future.get_future_state(db, subspace, f)
+
+    assert isinstance(f, future.UnclaimedFuture)
+
+    assert not future.resubmit_realized_future_bad_object_ref(
+        db, subspace, f.id, object_ref
+    )
+
+
 # TODO: fix the state machine tests -- non-deterministic somehow
 
 # @dataclass

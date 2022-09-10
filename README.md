@@ -35,9 +35,9 @@ client.await_future(z) # raises RemoteException with ZeroDivisionError and trace
 
 ## Features
 
+- Simple. 1k lines of Python.
 - Distributed futures executed by a cluster of workers.
 - Distributed storage of future outputs.
-- Very simple architecture. <1k lines of Python.
 - Resource requirement system -- specify that your future needs n CPUs, m bytes of memory, etc.
 - Fault tolerant -- retries, exception reporting, detects dead workers and reassigns their work, simple lineage system that can reconstruct lost outputs.
 

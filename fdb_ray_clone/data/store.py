@@ -114,9 +114,10 @@ class StoreClient(object):
     # the StoreClient constructor to detect this case. Even better if we detect
     # this at a higher level and never even construct a StoreClient.
     def get(self, name: str) -> Union[pa.Table, Any]:
-        sm = self.smm.get(name)._getvalue()  # type: ignore
+        # TODO: retries for transient network errors
+        sm = self.smm.get(name)._getvalue()  # type: ignore [attr-defined]
         return self._deserialize(sm.buf)
 
     def get_used_ram(self) -> int:
-        result: int = self.smm.get_used_ram()._getvalue()  # type: ignore
+        result: int = self.smm.get_used_ram()._getvalue()  # type: ignore [attr-defined]
         return result

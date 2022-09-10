@@ -1,5 +1,5 @@
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Set, Tuple
+from typing import Any, Dict, List, Set, Tuple, Generator
 import pytest
 import uuid
 from uuid import UUID
@@ -28,7 +28,9 @@ def subspace(db: fdb.Database) -> fdb.Subspace:
 
 
 @pytest.fixture
-def worker_config(db: fdb.Database, subspace: fdb.Subspace) -> worker.WorkerConfig:  # type: ignore
+def worker_config(
+    db: fdb.Database, subspace: fdb.Subspace
+) -> Generator[worker.WorkerConfig, None, None]:
     address = "localhost"
     port = 50001
     with StoreServer(address, port) as store:

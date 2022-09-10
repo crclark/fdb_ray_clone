@@ -301,7 +301,7 @@ class FutureClaim:
 # downside: objects created by futures can be recovered by recomputing the
 # future, objects created by put cannot be recovered.
 @dataclass(frozen=True)
-class FutureResult(Generic[T]):
+class ObjectRef(Generic[T]):
     timestamp: SecondsSinceEpoch
     worker_id: WorkerId
     name: str
@@ -378,7 +378,7 @@ class RealizedFuture(BaseFuture[T]):
 
     num_attempts: int
     latest_exception: Optional[FutureException]
-    latest_result: FutureResult[T]
+    latest_result: ObjectRef[T]
 
 
 @dataclass(frozen=True)
@@ -407,7 +407,7 @@ class AwaitFailed(Enum):
     FutureFailed = 3
 
 
-FutureWatch = Union[AwaitFailed, FutureFDBWatch[T], FutureResult[T]]
+FutureWatch = Union[AwaitFailed, FutureFDBWatch[T], ObjectRef[T]]
 
 
 @fdb.transactional
@@ -584,6 +584,29 @@ def submit_future(
 
 
 @fdb.transactional
+def resubmit_realized_future_bad_object_ref(
+    tr: fdb.Transaction, ss: fdb.Subspace, future_id: UUID, bad_object_ref: ObjectRef[T]
+) -> bool:
+    """Resubmit a future for recomputation by another worker if its object reference is broken (i.e., the worker is
+    unreachable, or the worker no longer contains the object).
+
+    Returns True if the future was successfully resubmitted. Returns False if the provided object reference is
+    out-of-date, which means that someone else has already resubmitted the future."""
+    future_ss = ss.subspace(("future", future_id))
+    current_object_ref = unpickle(tr[future_ss["latest_result"]].wait())
+
+    if current_object_ref != bad_object_ref:
+        # The caller's information is out of date; do nothing.
+        return False
+    else:
+        # The caller's information is up-to-date; resubmit the future.
+        del tr[future_ss["latest_result"]]
+        resource_requirements = unpickle(tr[future_ss["resource_requirements"]].wait())
+        write_resource_requirements(tr, ss, future_id, resource_requirements)
+        return True
+
+
+@fdb.transactional
 def future_exists(tr: fdb.Transaction, ss: fdb.Subspace, id: UUID) -> bool:
     future_ss = ss.subspace(("future", id))
     result: bool = tr.get(future_ss.pack(("code",))).wait().present()
@@ -671,7 +694,7 @@ def get_future_state(  # type: ignore [return] # TODO: wtf
                 num_attempts=num_attempts,
                 latest_exception=unpickle(latest_exception.wait()),
             )
-        case (None, FutureResult(), num_attempts, max_retries):
+        case (None, ObjectRef(), num_attempts, max_retries):
             return RealizedFuture(
                 id=future_id,
                 code=must_unpickle(code.wait()),
@@ -792,7 +815,7 @@ def realize_future(
         raise ClaimLostException(
             f"Worker {worker_id} lost claim on Future {future.id} while working on it. Current claim is {latest_claim}."
         )
-    future_result: FutureResult[T] = FutureResult(
+    future_result: ObjectRef[T] = ObjectRef(
         timestamp=seconds_since_epoch(),
         worker_id=worker_id,
         name=name,
@@ -874,7 +897,7 @@ def _create_future_watch(
     """Registers a watch with FDB on the result of the future. Must be awaited
     after the transaction has been committed."""
     future_ss = ss.subspace(("future", future.id))
-    result: Optional[FutureResult[T]] = unpickle(tr[future_ss["latest_result"]].wait())
+    result: Optional[ObjectRef[T]] = unpickle(tr[future_ss["latest_result"]].wait())
     exception: Optional[FutureException] = unpickle(
         tr[future_ss["latest_exception"]].wait()
     )
@@ -895,8 +918,8 @@ def _create_future_watch(
 @fdb.transactional
 def _get_future_watch_result(
     tr: fdb.Transaction, future_watch: FutureFDBWatch[T]
-) -> FutureResult[T]:
-    result: Optional[FutureResult[T]] = unpickle(tr.get(future_watch.result_key).wait())
+) -> ObjectRef[T]:
+    result: Optional[ObjectRef[T]] = unpickle(tr.get(future_watch.result_key).wait())
     if result:
         return result
     else:
@@ -931,7 +954,7 @@ def _await_future_watch(
     future_id: UUID,
     time_limit_secs: Optional[int] = None,
     presume_worker_dead_after_secs: Optional[int] = None,
-) -> Union[AwaitFailed, FutureResult[T]]:
+) -> Union[AwaitFailed, ObjectRef[T]]:
     """Blocks until the future has been realized and returns its result. If time limit is exceeded, returns None."""
     if isinstance(future_watch, FutureFDBWatch):
         started_at = seconds_since_epoch()
@@ -941,7 +964,7 @@ def _await_future_watch(
         while True:
             wait_duration = seconds_since_epoch() - started_at
             if future_watch.fdb_success_watch.is_ready():
-                result: FutureResult[T] = _get_future_watch_result(db, future_watch)
+                result: ObjectRef[T] = _get_future_watch_result(db, future_watch)
                 return result
             elif future_watch.fdb_failure_watch.is_ready():
                 return AwaitFailed.FutureFailed
@@ -973,7 +996,7 @@ def await_future(
     future: Future[T],
     time_limit_secs: Optional[int] = None,
     presume_worker_dead_after_secs: Optional[int] = None,
-) -> Union[AwaitFailed, FutureResult[T]]:
+) -> Union[AwaitFailed, ObjectRef[T]]:
     """Blocks until the future has been realized and returns its result.
     If time limit is exceeded, returns AwaitFailed.TimeLimitExceeded.
     If presume_worker_dead_after_secs is provided, returns AwaitFailed.WorkerPresumedDead
