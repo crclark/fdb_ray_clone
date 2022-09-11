@@ -114,7 +114,8 @@ def _work_on_future_with_retries(config: WorkerConfig, f: future.Future[T]) -> T
         return result
 
 
-# TODO: need comprehensive tests for this.
+# TODO: need comprehensive tests for this. Test all cases, and test that it
+# works recursively with chains of dependencies.
 @fdb.transactional
 def _claim_assigned_future(
     tr: fdb.Transaction, config: WorkerConfig

@@ -202,6 +202,10 @@ def init(cluster_name: str) -> None:
     GLOBAL_CLIENT = Client(cluster_name)
 
 
+# TODO: lineage reconstruction for the easy case where there are no locality
+# requirements.
+
+
 def submit_future(
     fn: Callable[..., T],
     *args: Any,
