@@ -26,16 +26,20 @@ Contains a list of all futures known to the system.
                   claim.
   - Failed -- num_attempts > max_retries + 1
 - A future can only be claimed by one worker at a time.
-- If a future is unclaimed, it is present in the resource_requirements_* secondary
-  index subspaces.
+- A future's UUID never changes, regardless of any state transitions it undergoes,
+  including resubmission when the worker processing it dies.
+- If a future is unclaimed, it is present in the resource_requirements_* xor
+  the worker_assignments secondary index subspaces (but not both).
 - If a future is claimed, its claim key is set.
 - A future can be moved from claimed to unclaimed without being realized in two
   ways:
-  - The worker that claimed the future voluntarily relinquishes the claim.
-  - The worker that claimed the future dies permanently and another worker detects
-    the situation and relinquishes the claim on behalf of the dead worker.
-    # TODO: figure out how this detection will work.
-- A future can be moved from realized to unrealized and unclaimed if a worker
+  - The worker that claimed the future voluntarily relinquishes the claim because
+    it died and restarted (this is a safety mechanism, just in case the worker
+    restarted with different resources and can't process the claim any more).
+  - The worker that claimed the future dies and the client or worker awaiting
+    the future detects the situation and relinquishes the claim on behalf of the
+    dead worker.
+- A future can be moved from realized to unclaimed if a worker
   detects that all stored copies of the future's result have been lost by
   worker crashes. This resets num_attempts (#TODO: should it?).
 
@@ -47,10 +51,10 @@ Contains a list of all futures known to the system.
   If this key is not present, the future
   has not yet been realized. For a full list of results of this future, see
   the results subspace.
-- key (`future_id`, 'dependencies'): value: pickled list of FutureParam objects.
-  These are the dependencies of the future, which are passed as parameters to
+- key (`future_id`, 'args'): value: pickled list of FutureParam objects.
+  These are the args of the future, which are passed as parameters to
   the future's function when it runs. If this key is not present, the
-  future has no dependencies.
+  future has no args.
 - key (`future_id`, 'num_attempts'): value: pickled int. The number of times
   a worker has attempted to realize a future. If this value is greater than one,
   a worker has encountered an exception while trying to realize the future, or
@@ -63,11 +67,11 @@ Contains a list of all futures known to the system.
   string of the last failure. If this key is not present, the future has never
   failed. If this key is present, the future has failed in the past, but may
   have succeeded since then.
-- key (`future_id`, 'resource_requirements'): value: ResourceRequirements object. The
-  resources required to realize the future. If this key is not present, any
+- key (`future_id`, 'requirements'): value: Requirements object. The
+  resource or locality requirements needed to realize the future. If this key is not present, any
   worker can realize the future. The values here are kept in sync with the
-  resource_requirements_cpu, resource_requirements_ram, and resource_requirements_gpu
-  subspaces, which are secondary indices into the futures subspace.
+  resource_requirements_cpu, resource_requirements_ram, resource_requirements_gpu, and
+  locality_requirements subspaces, which are secondary indices into the futures subspace.
 - key (`future_id`, 'claim'): value: pickled FutureClaim object. The claim on the
   future. If this key is not present, the future has not been claimed. If this
   key is present, the future has been claimed and a worker may be working on
@@ -145,6 +149,59 @@ though it may no longer contain the realized futures it used to.
   indicating the future the worker is currently working on. This is kept in sync
   with the claim key in the futures subspace. If this key is not present, the
   worker is not currently working on a future.
+
+# worker_assignments subspace
+
+Contains a list of all futures that have been assigned to a worker. This can be
+considered a special case of the resource_requirements_* subspaces, but it is
+only used for futures that must be executed by a particular worker, *because that
+worker, at the time the future was submitted, held a particular object*. Most
+futures can be executed by any worker, and workers grab work from a shared pool.
+Worker assignments are used by clients as either a performance optimization for
+data locality, or as a hard requirement, in the special case that the object is
+an actor (which is necessarily bound to a single worker because it has state).
+
+Workers are expected to prioritize their assignments over other futures. If an
+assignment was given to a worker because of an object reference that the worker
+no longer holds, the worker should first check if another copy of the object
+(same future_id provenance) is available on another worker. If so, it should
+reassign the future to that worker. If not, the worker should resubmit the
+future that created the object and instead look for other futures to work on.
+On the next iteration of this worker's main loop, this logic will trigger again
+and the work will get reassigned to whatever worker claimed the resubmitted future.
+
+There is a tricky case when the objectref is truly lost and the upstream work
+needs to be recomputed. The worker that is unable to do the work is responsible
+for resubmitting the future, but it cannot await it, because if there is only
+one worker, it would deadlock. It would also deadlock the cluster if two workers
+reassign lost objectref futures to each other and wait for the results. Actually,
+we could avoid deadlock if we always await with timeout, and upon timing out,
+try to claim a different future... and choose randomly between assigned futures
+and futures from the shared pool. If we are unlucky with the randomness or the
+number of retries is low, though, we could still hit problems, and the implementation
+complexity for this is high, and I am not sure it would fully solve the problem.
+
+What if we just resubmit the upstream future and don't await? How does the client
+waiting for our assigned future learn if the upstream future fails? We could
+fail our assigned future with an UpstreamDependencyFailedException describing the situation. Furthermore,
+if we see that the upstream future has died, how do we know whether it died
+after we resubmitted it, or it died for unrelated reasons, possibly because
+someone else resubmitted it? Maybe we simply shouldn't distinguish -- let the
+client sort it out if they want to, by again using UpstreamDependencyFailedException.
+
+## Invariants
+
+- If a future is assigned to a worker, it is not included in the resource_requirements_*
+  subspaces. This is because we don't want a situation where a future gets stuck because
+  it has a locality requirement and a resource requirement that mutually conflict.
+- A future is removed from the worker_assignments list for a worker when the
+  worker claims it, or when the worker reassigns it to another worker.
+
+## Key/values per future:
+
+- key (`worker_ip`, `worker_port`, "assignment", `future_id`):
+  value: pickled ObjectRef object specifying the reason why the future was assigned
+  to this worker.
 
 # Error handling and failure modes
 
@@ -224,11 +281,13 @@ from typing import (
     Callable,
     Dict,
     Generic,
+    Iterator,
     List,
     Literal,
     NoReturn,
     Optional,
     Set,
+    Tuple,
     TypeVar,
     Union,
 )
@@ -240,6 +299,7 @@ import time
 fdb.api_version(710)
 
 T = TypeVar("T")
+U = TypeVar("U")
 
 
 def unpickle(x: "fdb.Value") -> Optional[T]:
@@ -295,7 +355,7 @@ class FutureClaim:
     claimed_at: SecondsSinceEpoch
 
 
-# TODO: generalize this name to ObjectRef, and create a put_object function
+# TODO: create a put_object function
 # that doesn't require a corresponding future. Then get() can be used to get
 # any object, regardless of whether it was created by a future. Document the
 # downside: objects created by futures can be recovered by recomputing the
@@ -305,6 +365,17 @@ class ObjectRef(Generic[T]):
     timestamp: SecondsSinceEpoch
     worker_id: WorkerId
     name: str
+    future_id: UUID
+
+
+# TODO: function in client get_locality(future) -> Optional[LocalityRequirement]
+# to get the locality info for a future if the future has been realized.
+@dataclass(frozen=True)
+class LocalityRequirement(Generic[T]):
+    object_ref: ObjectRef[T]
+
+
+Requirements = Union[ResourceRequirements, LocalityRequirement[T]]
 
 
 @dataclass(frozen=True)
@@ -346,8 +417,11 @@ class WorkerHeartbeat:
 class BaseFuture(Generic[T]):
     id: UUID
     code: Callable[..., T]
-    dependencies: List[Any]
-    resource_requirements: ResourceRequirements
+    args: List[Any]
+    # no way to do existentials but we really don't care about U here, so
+    # ignore the type.
+    # https://stackoverflow.com/q/59621745
+    requirements: Requirements[U]  # type: ignore [valid-type]
     max_retries: int
 
 
@@ -415,11 +489,11 @@ def write_resource_requirements(
     tr: fdb.Transaction,
     ss: fdb.Subspace,
     future_id: UUID,
-    resource_requirements: ResourceRequirements,
+    requirements: ResourceRequirements,
 ) -> None:
     for resource in ["cpu", "ram", "gpu"]:
         resource_ss = ss.subspace((f"resource_requirements_{resource}",))
-        req = resource_requirements.__getattribute__(resource)
+        req = requirements.__getattribute__(resource)
         tr[resource_ss.pack((req, future_id))] = b""
 
 
@@ -474,6 +548,91 @@ def futures_fitting_resources(
         else:
             ret.intersection_update(reqs.keys())
     return list(ret)
+
+
+@fdb.transactional
+def write_worker_assignment(
+    tr: fdb.Transaction,
+    ss: fdb.Subspace,
+    worker_id: WorkerId,
+    future_id: UUID,
+    why: ObjectRef[T],
+) -> None:
+    assignment_subspace = ss.subspace(
+        ("worker_assignments", worker_id.address, worker_id.port)
+    )
+    tr[assignment_subspace[future_id]] = pickle.dumps(why)
+
+
+@fdb.transactional
+def clear_worker_assignment(
+    tr: fdb.Transaction, ss: fdb.Subspace, worker_id: WorkerId, future_id: UUID
+) -> None:
+    assignment_subspace = ss.subspace(
+        ("worker_assignments", worker_id.address, worker_id.port)
+    )
+    del tr[assignment_subspace[future_id]]
+
+
+@fdb.transactional
+def iterate_worker_assignments(
+    tr: fdb.Transaction,
+    ss: fdb.Subspace,
+    worker_id: WorkerId,
+    fn: Callable[[fdb.Transaction, UUID, ObjectRef[Any]], Optional[T]],
+) -> Optional[T]:
+    """Iterate over all the futures assigned to the given worker, and call fn
+    on each one. If fn returns a non-None value, then that value is returned
+    and iteration stops. Otherwise, None is returned."""
+    assignment_subspace = ss.subspace(
+        ("worker_assignments", worker_id.address, worker_id.port)
+    )
+    for key, value in tr.get_range(
+        assignment_subspace.range().start, assignment_subspace.range().stop
+    ):
+        result = fn(tr, assignment_subspace.unpack(key)[0], pickle.loads(value))
+        if result is not None:
+            return result
+    return None
+
+
+@fdb.transactional
+def get_all_assignments(
+    tr: fdb.Transaction, ss: fdb.Subspace, worker_id: WorkerId
+) -> List[Tuple[UUID, ObjectRef[T]]]:
+    ret = []
+    iterate_worker_assignments(tr, ss, worker_id, lambda tr, k, v: ret.append((k, v)))
+    return ret
+
+
+def write_requirements(
+    tr: fdb.Transaction,
+    ss: fdb.Subspace,
+    future_id: UUID,
+    requirements: Requirements[T],
+) -> None:
+    match requirements:
+        case ResourceRequirements():
+            write_resource_requirements(tr, ss, future_id, requirements)
+        case LocalityRequirement(object_ref):
+            write_worker_assignment(tr, ss, object_ref.worker_id, future_id, object_ref)
+        case [LocalityRequirement(object_ref), *rest]:
+            write_worker_assignment(tr, ss, object_ref.worker_id, future_id, object_ref)
+        case _:
+            raise Exception(f"Unknown requirement type: {type(requirements)}")
+
+
+def clear_requirements(
+    tr: fdb.Transaction,
+    ss: fdb.Subspace,
+    future_id: UUID,
+    requirements: Requirements[T],
+) -> None:
+    match requirements:
+        case ResourceRequirements():
+            clear_resource_requirements(tr, ss, future_id, requirements)
+        case LocalityRequirement(object_ref):
+            clear_worker_assignment(tr, ss, object_ref.worker_id, future_id)
 
 
 @fdb.transactional
@@ -557,29 +716,45 @@ def submit_future(
     tr: fdb.Transaction,
     ss: fdb.Subspace,
     future_code: Callable[..., T],
-    dependencies: List[Any],
-    resource_requirements: ResourceRequirements,
+    args: List[Any],
+    requirements: Union[ResourceRequirements, LocalityRequirement[T]],
     max_retries: int = 3,
     id: Optional[UUID] = None,
 ) -> UnclaimedFuture[T]:
-    # TODO: throw exception if dependencies are huge after pickling, instead of
+    """Submit a future to the cluster.
+
+    Parameters:
+
+    future_code -- the function to execute
+    args -- Python values that will be passed to the future as arguments.
+      These must be small in size -- use futures if you need to refer to a large
+      result of another future.
+    requirements -- the resources required to execute this future.
+      These can either be CPU, RAM, and GPU requirements, or a locality requirement.
+      A locality requirement indicates that the future must be executed on the
+      same worker as another completed future.
+    max_retries -- the maximum number of times to retry this future if it fails.
+    id -- the UUID to use for this future. If not provided, a random UUID will be
+      generated.
+    """
+    # TODO: throw exception if args are huge after pickling, instead of
     # letting the transaction fail.
     id = id or uuid.uuid4()
     future = UnclaimedFuture(
         id=id,
         code=future_code,
-        dependencies=dependencies,
-        resource_requirements=resource_requirements,
+        args=args,
+        requirements=requirements,
         max_retries=max_retries,
         num_attempts=0,
     )
     future_ss = ss.subspace(("future", id))
     tr[future_ss.pack(("code",))] = cloudpickle.dumps(future_code)
-    tr[future_ss.pack(("dependencies",))] = cloudpickle.dumps(dependencies)
-    tr[future_ss.pack(("resource_requirements",))] = pickle.dumps(resource_requirements)
+    tr[future_ss.pack(("args",))] = cloudpickle.dumps(args)
+    tr[future_ss.pack(("requirements",))] = pickle.dumps(requirements)
     tr[future_ss.pack(("max_retries",))] = pickle.dumps(max_retries)
 
-    write_resource_requirements(tr, ss, future.id, resource_requirements)
+    write_requirements(tr, ss, future.id, requirements)
     return future
 
 
@@ -601,8 +776,12 @@ def resubmit_realized_future_bad_object_ref(
     else:
         # The caller's information is up-to-date; resubmit the future.
         del tr[future_ss["latest_result"]]
-        resource_requirements = unpickle(tr[future_ss["resource_requirements"]].wait())
-        write_resource_requirements(tr, ss, future_id, resource_requirements)
+        del tr[future_ss["num_attempts"]]
+        requirements = unpickle(tr[future_ss["requirements"]].wait())
+        if requirements:
+            write_requirements(tr, ss, future_id, requirements)
+        else:
+            raise Exception("Impossible happened: future has no requirements")
         return True
 
 
@@ -645,8 +824,8 @@ def get_future_state(  # type: ignore [return] # TODO: wtf
 
     # The remaining keys
     code = tr[future_ss["code"]]
-    dependencies = tr[future_ss["dependencies"]]
-    resource_requirements = tr[future_ss["resource_requirements"]]
+    args = tr[future_ss["args"]]
+    requirements = tr[future_ss["requirements"]]
     latest_exception = tr[future_ss["latest_exception"]]
 
     if not future_exists(tr, ss, future_id):
@@ -667,8 +846,8 @@ def get_future_state(  # type: ignore [return] # TODO: wtf
             return FailedFuture(
                 id=future_id,
                 code=must_unpickle(code.wait()),
-                dependencies=must_unpickle(dependencies.wait()),
-                resource_requirements=must_unpickle(resource_requirements.wait()),
+                args=must_unpickle(args.wait()),
+                requirements=must_unpickle(requirements.wait()),
                 max_retries=max_retries,
                 num_attempts=num_attempts,
                 latest_exception=must_unpickle(latest_exception.wait()),
@@ -677,8 +856,8 @@ def get_future_state(  # type: ignore [return] # TODO: wtf
             return UnclaimedFuture(
                 id=future_id,
                 code=must_unpickle(code.wait()),
-                dependencies=must_unpickle(dependencies.wait()),
-                resource_requirements=must_unpickle(resource_requirements.wait()),
+                args=must_unpickle(args.wait()),
+                requirements=must_unpickle(requirements.wait()),
                 max_retries=max_retries,
                 num_attempts=num_attempts,
             )
@@ -687,8 +866,8 @@ def get_future_state(  # type: ignore [return] # TODO: wtf
             return ClaimedFuture(
                 id=future_id,
                 code=must_unpickle(code.wait()),
-                dependencies=must_unpickle(dependencies.wait()),
-                resource_requirements=must_unpickle(resource_requirements.wait()),
+                args=must_unpickle(args.wait()),
+                requirements=must_unpickle(requirements.wait()),
                 max_retries=max_retries,
                 claim=claim,
                 num_attempts=num_attempts,
@@ -698,8 +877,8 @@ def get_future_state(  # type: ignore [return] # TODO: wtf
             return RealizedFuture(
                 id=future_id,
                 code=must_unpickle(code.wait()),
-                dependencies=must_unpickle(dependencies.wait()),
-                resource_requirements=must_unpickle(resource_requirements.wait()),
+                args=must_unpickle(args.wait()),
+                requirements=must_unpickle(requirements.wait()),
                 max_retries=max_retries,
                 num_attempts=num_attempts,
                 latest_result=latest_result,
@@ -729,12 +908,12 @@ def relinquish_claim(
         )
     del tr[future_ss["claim"]]
     _clear_worker_claim_future(tr, ss, future.claim.worker_id)
-    write_resource_requirements(tr, ss, future.id, future.resource_requirements)
+    write_requirements(tr, ss, future.id, future.requirements)
     return UnclaimedFuture(
         id=future.id,
         code=future.code,
-        dependencies=future.dependencies,
-        resource_requirements=future.resource_requirements,
+        args=future.args,
+        requirements=future.requirements,
         max_retries=future.max_retries,
         num_attempts=future.num_attempts,
     )
@@ -746,7 +925,7 @@ def relinquish_claim(
 def claim_future(
     tr: fdb.Transaction,
     ss: fdb.Subspace,
-    future: Union[UUID, UnclaimedFuture[T]],
+    future: Union[UUID, UnclaimedFuture[T]],  # TODO: replace all Union with |
     worker_address: str,
     worker_port: int,
     force: bool = False,
@@ -766,9 +945,7 @@ def claim_future(
     if not force and not isinstance(unclaimed_future, UnclaimedFuture):
         raise Exception(f"Future {future_id} is not unclaimed: {unclaimed_future}")
 
-    clear_resource_requirements(
-        tr, ss, unclaimed_future.id, unclaimed_future.resource_requirements
-    )
+    clear_requirements(tr, ss, unclaimed_future.id, unclaimed_future.requirements)
     worker_id = WorkerId(worker_address, worker_port)
     _set_worker_claim_future(tr, ss, worker_id, future_id)
     claim = FutureClaim(
@@ -780,8 +957,8 @@ def claim_future(
     return ClaimedFuture(
         id=future_id,
         code=unclaimed_future.code,
-        dependencies=unclaimed_future.dependencies,
-        resource_requirements=unclaimed_future.resource_requirements,
+        args=unclaimed_future.args,
+        requirements=unclaimed_future.requirements,
         max_retries=unclaimed_future.max_retries,
         claim=claim,
         num_attempts=0,
@@ -819,6 +996,7 @@ def realize_future(
         timestamp=seconds_since_epoch(),
         worker_id=worker_id,
         name=name,
+        future_id=future.id,
     )
     tr[future_ss["latest_result"]] = pickle.dumps(future_result)
     # TODO: blind writes are brittle
@@ -828,8 +1006,8 @@ def realize_future(
     return RealizedFuture(
         id=future.id,
         code=future.code,
-        dependencies=future.dependencies,
-        resource_requirements=future.resource_requirements,
+        args=future.args,
+        requirements=future.requirements,
         max_retries=future.max_retries,
         num_attempts=future.num_attempts + 1,
         latest_result=future_result,
@@ -843,11 +1021,16 @@ def fail_future(
     ss: fdb.Subspace,
     future: ClaimedFuture[T],
     exception_message: str,
+    fail_permanently: bool = False,
 ) -> Union[FailedFuture[T], ClaimedFuture[T]]:
     """Records an exception that occurred while running the future's code, and
        increments num_attempts on the future.
     Returns a FailedFuture if the future has exceeded its max_retries.
-    Throws if the future has been claimed by another worker."""
+    Throws if the future has been claimed by another worker.
+
+    Keyword arguments:
+    fail_permanently -- if True, set num_attempts to max_retries + 1, so that
+    the future will be marked as failed permanently."""
 
     if not future_exists(tr, ss, future.id):
         raise FutureDoesNotExistException(future.id)
@@ -864,25 +1047,25 @@ def fail_future(
     # TODO: blind writes are brittle
     tr[future_ss["num_attempts"]] = pickle.dumps(future.num_attempts + 1)
 
-    if future.num_attempts >= future.max_retries:
+    if fail_permanently or future.num_attempts >= future.max_retries:
         # clear the claim and return failure object.
         _clear_worker_claim_future(tr, ss, future.claim.worker_id)
         del tr[future_ss["claim"]]
         return FailedFuture(
             id=future.id,
             code=future.code,
-            dependencies=future.dependencies,
-            resource_requirements=future.resource_requirements,
+            args=future.args,
+            requirements=future.requirements,
             max_retries=future.max_retries,
-            num_attempts=future.num_attempts + 1,
+            num_attempts=future.max_retries + 1,
             latest_exception=future_exception,
         )
     else:
         return ClaimedFuture(
             id=future.id,
             code=future.code,
-            dependencies=future.dependencies,
-            resource_requirements=future.resource_requirements,
+            args=future.args,
+            requirements=future.requirements,
             max_retries=future.max_retries,
             claim=future.claim,
             num_attempts=future.num_attempts + 1,

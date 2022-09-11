@@ -89,6 +89,14 @@ class StoreServer(object):
         except pickle.PicklingError:
             return False
 
+    # TODO: `name` is a terrible name; find a better one.
+    def has_name(self, name: str) -> bool:
+        try:
+            self.get(name)
+            return True
+        except FileNotFoundError:
+            return False
+
 
 class StoreClient(object):
     """Client for a StoreServer. Enables remote access to the objects stored in the

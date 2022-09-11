@@ -6,19 +6,13 @@ We need the following processes per worker:
 - A store process that is responsible for storing and serving objects.
 - A heartbeat process that monitors the other two processes and sends heartbeats
   to FoundationDB.
-
-Something that is unclear to me is how the worker stores stuff in the store if
-the store is a separate process. I guess we need a queue or something. For the
-first version, let's try keeping the worker and store in the same process and
-see what happens. Maybe the SharedMemoryManager server is already running on a
-separate process and we won't have a problem. TODO: test this by storing something
-and then have the worker busy loop and see if the store still responds to requests.
 """
 
 import fdb_ray_clone.control.future as future
 from fdb_ray_clone.data.store import StoreServer, StoreClient
 import fdb_ray_clone.client as client
 
+from uuid import UUID
 import argparse
 import logging
 import time
@@ -29,6 +23,7 @@ import pickle
 import sys
 import signal
 import os
+import random
 import traceback
 from typing import (
     Any,
@@ -97,21 +92,162 @@ def _report_failure(
         raise e
 
 
+def _exception_to_string(e: Exception) -> str:
+    exception_type, error, tb = sys.exc_info()
+    error_lines = traceback.format_exception(exception_type, error, tb)
+    exception_msg = "\n".join(error_lines)
+    return exception_msg
+
+
 def _work_on_future_with_retries(config: WorkerConfig, f: future.Future[T]) -> T:
     while True:
         try:
-            result = f.code(*f.dependencies)
+            result = f.code(*f.args)
             if not config.store.can_store(result):
                 raise Exception(f"Result {result} is not picklable.")
         except Exception as e:
-            exception_type, error, tb = sys.exc_info()
-            error_lines = traceback.format_exception(exception_type, error, tb)
-            exception_msg = "\n".join(error_lines)
+            exception_msg = _exception_to_string(e)
             f = _report_failure(config, f, exception_msg)
             if isinstance(f, future.FailedFuture):
                 raise MaxRetriesExceededException
             continue
         return result
+
+
+# TODO: need comprehensive tests for this.
+@fdb.transactional
+def _claim_assigned_future(
+    tr: fdb.Transaction, config: WorkerConfig
+) -> Optional[future.ClaimedFuture[T]]:
+    """Claim a future that was assigned to this worker by the LocalityRequirement
+    system. These are futures that the client believed that only this particular
+    worker can process because this worker holds a particular object."""
+
+    logging.info("Entered _claim_assigned_future")
+
+    @fdb.transactional
+    def claim_or_reassign(  # type: ignore [return] # TODO: hitting this mpypy bug (?) a lot
+        tr: fdb.Transaction,
+        assigned_future_id: UUID,
+        why_assigned: future.ObjectRef[Any],
+    ) -> Optional[future.ClaimedFuture[T]]:
+        """For a future assigned to this worker by the LocalityRequirement system,
+        check whether we still have the objectref needed by this future. If not,
+        check whether another worker has a newer ObjectRef containing the same
+        object and reassign to that worker. If not, resubmit the future that
+        created the object and continue. See worker_assignments subspace
+        design doc for more details."""
+        assigned_future = future.get_future_state(tr, config.ss, assigned_future_id)
+        logging.info(f"Examining assigned future {assigned_future}")
+        if config.store.has_name(why_assigned.name):
+            # We still have the objectref needed by this future. Claim it.
+            future.clear_worker_assignment(
+                tr, config.ss, config.worker_id, assigned_future_id
+            )
+
+            claimed_future: future.ClaimedFuture[T] = future.claim_future(
+                tr,
+                config.ss,
+                assigned_future,
+                config.worker_id.address,
+                config.worker_id.port,
+            )
+            logging.info(
+                f"Worker has object in store. Claimed assigned future {assigned_future}."
+            )
+            return claimed_future
+        else:
+            # We no longer have the objectref needed by this future. Check if
+            # another worker has a newer ObjectRef containing the same object.
+            # If so, reassign to that worker. If not, resubmit the future that
+            # created the object and continue.
+
+            upstream_future = future.get_future_state(
+                tr, config.ss, why_assigned.future_id
+            )
+
+            logging.info(
+                f"Worker has no object in store. Upstream future is {upstream_future}."
+            )
+            match upstream_future:
+                case future.UnclaimedFuture() | future.ClaimedFuture():
+                    # Someone will claim or has claimed this work.
+                    # The upstream future will be eventually realized and a later
+                    # iteration of this loop will reassign assigned_future
+                    # to the claimant. We can't do it yet because we need to
+                    # supply the why_assigned field with an ObjectRef, which
+                    # we don't have yet.
+                    logging.info(
+                        f"Upstream future is already being recomputed. Looking for other assigned futures while we wait for upstream."
+                    )
+                    return None
+                case future.FailedFuture(latest_exception=upstream_exception):
+                    # Someone (maybe even us) tried to re-try the upstream
+                    # future but it hit its max retries limit. Our assignedassigned_future_id
+                    # future can't be realized because this dependency is missing,
+                    # so we need to transition our assigned future to the failed state.
+
+                    logging.info(
+                        f"Upstream future has failed. Failing assigned future."
+                    )
+                    future.clear_worker_assignment(
+                        tr, config.ss, config.worker_id, assigned_future_id
+                    )
+                    # State machine only allows us to fail a future we have claimed,
+                    # so we need to claim it first.
+                    claimed_future = future.claim_future(
+                        tr,
+                        config.ss,
+                        assigned_future,
+                        config.worker_id.address,
+                        config.worker_id.port,
+                    )
+                    future.fail_future(
+                        tr,
+                        config.ss,
+                        claimed_future,
+                        _exception_to_string(
+                            client.UpstreamDependencyFailedException(upstream_exception)
+                        ),
+                        fail_permanently=True,
+                    )
+                    return None
+                case future.RealizedFuture(
+                    latest_result=upstream_result
+                ) if upstream_result == why_assigned:
+                    # The upstream future was last computed by this worker, before it crashed. It
+                    # needs to be resubmitted.
+                    future.resubmit_realized_future_bad_object_ref(
+                        tr, config.ss, upstream_future.id, why_assigned
+                    )
+                    return None
+                case future.RealizedFuture(
+                    latest_result=upstream_result
+                ) if upstream_result != why_assigned:
+                    # Someone (maybe even us) has already realized the upstream
+                    # future. We can now reassign our assigned future to that
+                    # worker.
+                    # TODO: we could have a fast path here for the special case
+                    # where the current worker re-realized the future.
+                    logging.info(
+                        "Upstream future has been realized. Reassigning this assigned future to the worker that now has the upstream object."
+                    )
+                    future.clear_worker_assignment(
+                        tr, config.ss, config.worker_id, assigned_future_id
+                    )
+                    future.write_worker_assignment(
+                        tr,
+                        config.ss,
+                        upstream_result.worker_id,
+                        assigned_future_id,
+                        upstream_result,
+                    )
+                    return None
+
+    result: Optional[future.ClaimedFuture[T]] = future.iterate_worker_assignments(
+        tr, config.ss, config.worker_id, claim_or_reassign
+    )
+    return result
 
 
 def _current_resources(config: WorkerConfig) -> future.WorkerResources:
@@ -126,6 +262,7 @@ def _current_resources(config: WorkerConfig) -> future.WorkerResources:
 def _claim_one_future(
     tr: fdb.Transaction, config: WorkerConfig
 ) -> Optional[future.ClaimedFuture[T]]:
+    logging.info("Entered _claim_one_future")
     current_resources = _current_resources(config)
     eligible_futures = future.futures_fitting_resources(
         tr, config.ss, current_resources
@@ -153,9 +290,21 @@ def _realize_future(
 
 
 def _process_one_future(config: WorkerConfig) -> None:
-    f = _claim_one_future(config.db, config)
+    # To avoid deadlock, randomize whether we look at assigned futures or
+    # any future that fits on this worker.
+    logging.info("Looking for future to process.")
+    f = (
+        _claim_one_future(config.db, config)
+        or _claim_assigned_future(config.db, config)
+        if random.choice([True, False])
+        else _claim_assigned_future(config.db, config)
+        or _claim_one_future(config.db, config)
+    )
+    logging.info(f"Found {f}")
+
     if f is None:
         # TODO: make configurable
+        logging.debug("No work to do. Sleeping for 5 seconds.")
         time.sleep(5)
         return None
     else:
@@ -233,7 +382,9 @@ def worker_loop(
         max_ram=max_ram,
         max_gpu=max_gpu,
     )
+    logging.info("Cleaning up any stale state.")
     _relinquish_old_claim(db, config)
+    logging.info("Starting worker loop.")
     while True:
         try:
             _process_one_future(config)

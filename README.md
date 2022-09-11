@@ -20,18 +20,48 @@ https://apple.github.io/foundationdb/downloads.html
 
 ```python
 import fdb_ray_clone.client as client
+
 client.init("demo_cluster_name")
 x = client.submit_future(lambda x, y: x + y, 1, 2)
-client.await_future(x) # returns 3
+client.await_future(x)  # returns 3
 
 # You can close over futures, or pass them into other futures explicitly.
 y = client.submit_future(lambda z: client.await_future(x) + client.await_future(z), x)
-client.await_future(y) # returns 6
+client.await_future(y)  # returns 6
 
 # Exceptions are propagated back to the client
 z = client.submit_future(lambda: 1 / 0)
-client.await_future(z) # raises RemoteException with ZeroDivisionError and traceback from worker
+client.await_future(
+    z
+)  # raises RemoteException with ZeroDivisionError and traceback from worker
+
 ```
+
+#### Locality requirements
+
+You can require that a future run on the same worker as a previous future, to ensure that the new future has fast access to the previous future's results, without network transfer overhead.
+
+```python
+
+import fdb_ray_clone.client as client
+
+client.init("demo_cluster_name")
+x = client.submit_future(lambda x, y: x + y, 1, 2)
+client.await_future(x)
+
+locality = client.locality(x)
+
+# If you want to test lineage reconstruction, ctrl-c the
+# worker and restart it before running the next line.
+
+y = client.submit_future(
+    lambda x, y: client.await_future(x) + y, x, 5, locality=locality
+)
+client.await_future(y) # returns 8
+```
+
+
+
 
 ## Features
 
@@ -45,7 +75,7 @@ client.await_future(z) # raises RemoteException with ZeroDivisionError and trace
 
 Each worker process is running a Python [SharedMemoryManager](https://docs.python.org/3/library/multiprocessing.shared_memory.html#multiprocessing.managers.SharedMemoryManager), which is a lightweight way to share memory between Python processes over a network. The hello world of SharedMemoryManager examples crashes in my system Python [because of a bug](https://stackoverflow.com/questions/59172691/why-do-we-get-a-nameerror-when-trying-to-use-the-sharedmemorymanager-python-3-8), so this requires Python >3.8.
 
-The SharedMemoryManager configuration **assumes a private network.** `authkey` is set to a constant string.
+The SharedMemoryManager configuration **assumes a private network.** There is no auth mechanism.
 
 Each shared memory buffer contains a Python object. There is an optimized write path for PyArrow that uses lz4 compression.
 

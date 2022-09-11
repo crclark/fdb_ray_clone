@@ -22,6 +22,7 @@ import fdb
 fdb.api_version(710)
 
 T = TypeVar("T")
+U = TypeVar("U")
 
 
 @dataclass(frozen=True)
@@ -30,6 +31,10 @@ class Future(Generic[T]):
 
 
 class WorkerDiedException(Exception):
+    pass
+
+
+class UpstreamDependencyFailedException(Exception):
     pass
 
 
@@ -43,15 +48,25 @@ class Client(object):
         self.db = fdb.open()
         self.clients: Dict[future.WorkerId, store.StoreClient] = dict()
 
+    def _destroy_all_cluster_state(self) -> None:
+        """Wipes all distributed future/actor data in FoundationDB.
+        For debugging/testing only."""
+        self.db.clear_range(self.ss.range().start, self.ss.range().stop)
+
     def submit_future(
         self,
         fn: Callable[..., T],
         *args: Any,
         min_cpu: int = 0,
         min_ram: int = 0,
-        min_gpu: int = 0
+        min_gpu: int = 0,
+        locality: Optional[future.LocalityRequirement[U]] = None,
     ) -> Future[T]:
-        resources = future.ResourceRequirements(min_cpu, min_ram, min_gpu)
+        resources = (
+            locality
+            if locality
+            else future.ResourceRequirements(min_cpu, min_ram, min_gpu)
+        )
         return Future(
             _future=future.submit_future(self.db, self.ss, fn, args, resources)
         )
@@ -86,6 +101,23 @@ class Client(object):
         future.resubmit_realized_future_bad_object_ref(
             tr, self.ss, f._future.id, object_ref
         )
+
+    @fdb.transactional
+    def _locality(
+        self, tr: fdb.Transaction, f: Future[T]
+    ) -> List[future.LocalityRequirement[T]]:
+        future_state = future.get_future_state(tr, self.ss, f._future)
+        match future_state:
+            case future.RealizedFuture(latest_result=latest_result):
+                return [future.LocalityRequirement(latest_result)]
+            case _:
+                return []
+
+    def locality(self, f: Future[T]) -> List[future.LocalityRequirement[T]]:
+        """Get the list of workers that contain the results of this future, if any.
+        Returns an empty list if the future is not yet completed, or failed."""
+        ret: List[future.LocalityRequirement[T]] = self._locality(self.db, f)
+        return ret
 
     def await_future(  # type: ignore [return] # TODO: mypy false positive?
         self,
@@ -175,14 +207,15 @@ def submit_future(
     *args: Any,
     min_cpu: int = 0,
     min_ram: int = 0,
-    min_gpu: int = 0
+    min_gpu: int = 0,
+    locality: Optional[future.LocalityRequirement[U]] = None,
 ) -> Future[T]:
     """Submit a future to the cluster. Returns a Future object that can be used to
     await the result."""
     if GLOBAL_CLIENT is None:
         raise Exception("Must call fdb_ray_clone.init() before submitting futures.")
     return GLOBAL_CLIENT.submit_future(
-        fn, *args, min_cpu=min_cpu, min_ram=min_ram, min_gpu=min_gpu
+        fn, *args, min_cpu=min_cpu, min_ram=min_ram, min_gpu=min_gpu, locality=locality
     )
 
 
@@ -201,3 +234,11 @@ def await_future(
     return GLOBAL_CLIENT.await_future(
         f, time_limit_secs, presume_worker_dead_after_secs
     )
+
+
+def locality(f: Future[T]) -> List[future.LocalityRequirement[T]]:
+    """Get the list of workers that contain the results of this future, if any.
+    Returns an empty list if the future is not yet completed, or failed."""
+    if GLOBAL_CLIENT is None:
+        raise Exception("Must call fdb_ray_clone.init() before submitting futures.")
+    return GLOBAL_CLIENT.locality(f)

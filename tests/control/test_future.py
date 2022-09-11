@@ -1,5 +1,5 @@
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Set, Tuple
+from typing import Any, Dict, List, Set, Tuple, TypeVar
 import pytest
 import uuid
 from uuid import UUID
@@ -21,6 +21,8 @@ import fdb
 
 fdb.api_version(710)
 
+T = TypeVar("T")
+
 
 @pytest.fixture
 def db() -> fdb.Database:
@@ -39,8 +41,8 @@ def subspace(db: fdb.Database) -> fdb.Subspace:
 def nonexistent_future() -> future.UnclaimedFuture[int]:
     return future.UnclaimedFuture(
         code=lambda: 1,
-        dependencies=[],
-        resource_requirements=future.ResourceRequirements(),
+        args=[],
+        requirements=future.ResourceRequirements(),
         max_retries=3,
         id=UUID("00000000-0000-0000-0000-000000000000"),
         num_attempts=0,
@@ -55,8 +57,8 @@ def test_create_get_future(db: fdb.Database, subspace: fdb.Subspace) -> None:
     f = future.get_future_state(db, subspace, f)
 
     assert isinstance(f, future.UnclaimedFuture)
-    assert f.code(*f.dependencies) == 3
-    assert f.resource_requirements == future.ResourceRequirements()
+    assert f.code(*f.args) == 3
+    assert f.requirements == future.ResourceRequirements()
     assert f.max_retries == 3
 
 
@@ -378,6 +380,39 @@ def test_resubmit_realized_future_bad_object_ref(
     assert not future.resubmit_realized_future_bad_object_ref(
         db, subspace, f.id, object_ref
     )
+
+
+def test_locality_requirements(db: fdb.Database, subspace: fdb.Subspace) -> None:
+    w1 = future.WorkerId("localhost", 1234)
+    w2 = future.WorkerId("localhost", 4321)
+
+    f1 = future.submit_future(
+        db,
+        subspace,
+        lambda: 1,
+        [],
+        future.LocalityRequirement(future.ObjectRef(1, w1, "buffername", uuid.uuid4())),
+    )
+
+    f2 = future.submit_future(
+        db,
+        subspace,
+        lambda: 1,
+        [],
+        future.LocalityRequirement(future.ObjectRef(1, w2, "buffername", uuid.uuid4())),
+    )
+
+    assignments1 = future.get_all_assignments(db, subspace, w1)
+    assignments2 = future.get_all_assignments(db, subspace, w2)
+
+    assert len(assignments1) == 1
+    assert len(assignments2) == 1
+
+    assert assignments1[0][0] == f1.id
+    assert assignments2[0][0] == f2.id
+
+    future.clear_worker_assignment(db, subspace, w1, assignments1[0][0])
+    assert len(future.get_all_assignments(db, subspace, w1)) == 0
 
 
 # TODO: fix the state machine tests -- non-deterministic somehow
