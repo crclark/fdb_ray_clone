@@ -230,7 +230,7 @@ def write_resource_requirements(
     for resource in ["cpu", "ram", "gpu"]:
         resource_ss = ss.subspace((f"resource_requirements_{resource}",))
         req = requirements.__getattribute__(resource)
-        tr[resource_ss.pack((req, future_id))] = b""
+        tr[resource_ss[req][future_id]] = b""
 
 
 @fdb.transactional
@@ -243,7 +243,7 @@ def clear_resource_requirements(
     for resource in ["cpu", "ram", "gpu"]:
         resource_ss = ss.subspace((f"resource_requirements_{resource}",))
         req = resource_requirements.__getattribute__(resource)
-        del tr[resource_ss.pack((req, future_id))]
+        del tr[resource_ss[req][future_id]]
 
 
 @fdb.transactional
@@ -259,7 +259,7 @@ def scan_resource_requirements(
     Returns a dict where the keys are future ids and the values are requirements
     for the given resource."""
     resource_ss = ss.subspace((f"resource_requirements_{resource}",))
-    end_key = resource_ss.pack((max_value + 1,))
+    end_key = resource_ss[max_value + 1]
     ret = dict()
     for key, _ in tr.snapshot.get_range(resource_ss.range().start, end_key):
         req, future_id = resource_ss.unpack(key)
@@ -415,7 +415,7 @@ def write_worker_heartbeat(
     worker_ss = ss.subspace((f"workers",))
     # Reading a somewhat stale heartbeat is okay.
     tr.options.set_next_write_no_write_conflict_range()
-    tr[worker_ss.pack((worker_id.address, worker_id.port, "heartbeat"))] = pickle.dumps(
+    tr[worker_ss[worker_id.address][worker_id.port]["heartbeat"]] = pickle.dumps(
         heartbeat
     )
 
@@ -427,7 +427,7 @@ def get_worker_heartbeat(
     worker_id: WorkerId,
 ) -> Optional[WorkerHeartbeat]:
     worker_ss = ss.subspace((f"workers",))
-    val = tr[worker_ss.pack((worker_id.address, worker_id.port, "heartbeat"))]
+    val = tr[worker_ss[worker_id.address][worker_id.port]["heartbeat"]]
     return unpickle(val)
 
 
@@ -487,11 +487,11 @@ def submit_future(
         allow_reconstruction=allow_reconstruction,
     )
     future_ss = ss.subspace(("future", id))
-    tr[future_ss.pack(("code",))] = cloudpickle.dumps(future_code)
-    tr[future_ss.pack(("args",))] = cloudpickle.dumps(args)
-    tr[future_ss.pack(("requirements",))] = pickle.dumps(requirements)
-    tr[future_ss.pack(("max_retries",))] = pickle.dumps(max_retries)
-    tr[future_ss.pack(("allow_reconstruction",))] = pickle.dumps(allow_reconstruction)
+    tr[future_ss["code"]] = cloudpickle.dumps(future_code)
+    tr[future_ss["args"]] = cloudpickle.dumps(args)
+    tr[future_ss["requirements"]] = pickle.dumps(requirements)
+    tr[future_ss["max_retries"]] = pickle.dumps(max_retries)
+    tr[future_ss["allow_reconstruction"]] = pickle.dumps(allow_reconstruction)
 
     write_requirements(tr, ss, future.id, requirements)
     return future
@@ -527,7 +527,7 @@ def resubmit_realized_future_bad_object_ref(
 @fdb.transactional
 def future_exists(tr: fdb.Transaction, ss: fdb.Subspace, id: UUID) -> bool:
     future_ss = ss.subspace(("future", id))
-    result: bool = tr.get(future_ss.pack(("code",))).wait().present()
+    result: bool = tr[future_ss["code"]].wait().present()
     return result
 
 
@@ -860,7 +860,7 @@ def _create_future_watch(
 def _get_future_watch_result(
     tr: fdb.Transaction, future_watch: FutureFDBWatch[T]
 ) -> ObjectRef[T]:
-    result: Optional[ObjectRef[T]] = unpickle(tr.get(future_watch.result_key).wait())
+    result: Optional[ObjectRef[T]] = unpickle(tr[future_watch.result_key].wait())
     if result:
         return result
     else:
