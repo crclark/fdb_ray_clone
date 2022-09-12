@@ -36,7 +36,6 @@ from typing import (
     Optional,
     Set,
     TypeVar,
-    Union,
 )
 
 import fdb
@@ -77,13 +76,13 @@ def _report_failure(
     config: WorkerConfig,
     f: future.Future[T],
     exception_message: str,
-) -> Union[future.FailedFuture[T], future.ClaimedFuture[T]]:
+) -> future.FailedFuture[T] | future.ClaimedFuture[T]:
     logging.exception(
         f"Failed to process future {f} because of exception {exception_message}"
     )
     try:
-        fail_result: Union[
-            future.FailedFuture[T], future.ClaimedFuture[T]
+        fail_result: future.FailedFuture[T] | future.ClaimedFuture[
+            T
         ] = future.fail_future(config.db, config.ss, f, exception_message)
         return fail_result
     except Exception as e:

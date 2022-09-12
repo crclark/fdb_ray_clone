@@ -8,7 +8,6 @@ from typing import (
     Optional,
     Set,
     TypeVar,
-    Union,
 )
 from dataclasses import dataclass
 import logging

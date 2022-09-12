@@ -1,5 +1,5 @@
 from dataclasses import dataclass
-from typing import Any, Dict, Generic, Optional, TypeVar, Union
+from typing import Any, Dict, Generic, Optional, TypeVar
 import uuid
 import pickle
 from multiprocessing.managers import SharedMemoryManager
@@ -37,6 +37,7 @@ class StoreServer(object):
         self.smm.register("get", self.get)
         self.smm.register("get_used_ram", self.get_used_ram)
         # TODO: use psutil instead https://stackoverflow.com/a/21632554/108268
+        # This should allow us to account for actor memory usage, too.
         self.used_ram = 0
         self.actors: Dict[uuid.UUID, Any] = dict()
 
@@ -45,7 +46,6 @@ class StoreServer(object):
         return self
 
     def __exit__(self, _exc_type: type, _exc_val: Any, _exc_tb: Any) -> None:
-        # TODO: log exception, re-throw?
         self.smm.shutdown()
 
     def get(self, name: str) -> SharedMemory:
@@ -86,7 +86,7 @@ class StoreServer(object):
         sm.buf[:] = pickled
         return sm
 
-    def store_local(self, x: Union[pa.Table, Any]) -> SharedMemory:
+    def store_local(self, x: pa.Table | Any) -> SharedMemory:
         """Stores x in a new byte buffer in the local machine's memory. Returns
         the SharedMemory object in which the object was stored."""
 
@@ -96,7 +96,7 @@ class StoreServer(object):
         else:
             return self._store_picklable_object(x)
 
-    def can_store(self, x: Union[pa.Table, Any]) -> bool:
+    def can_store(self, x: pa.Table | Any) -> bool:
         """Returns True if x can be passed to store_local, False otherwise."""
         if isinstance(x, pa.Table) or isinstance(x, Actor):
             return True
@@ -139,7 +139,7 @@ class StoreClient(object):
         self.smm.register("get_used_ram")
         self.smm.connect()
 
-    def _deserialize(self, buf: bytes) -> Union[pa.Table, Any]:
+    def _deserialize(self, buf: bytes) -> pa.Table | Any:
         try:
             df_buffer = pa.BufferReader(pa.py_buffer(buf))
             reader = pa.RecordBatchStreamReader(df_buffer)
@@ -152,7 +152,7 @@ class StoreClient(object):
     # a round trip over the network. We'll need to pass the WorkerConfig into
     # the StoreClient constructor to detect this case. Even better if we detect
     # this at a higher level and never even construct a StoreClient.
-    def get(self, name: str) -> Union[pa.Table, Any]:
+    def get(self, name: str) -> pa.Table | Any:
         # TODO: retries for transient network errors
         sm = self.smm.get(name)._getvalue()  # type: ignore [attr-defined]
         return self._deserialize(sm.buf)

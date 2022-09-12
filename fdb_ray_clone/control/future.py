@@ -8,16 +8,6 @@
 """
 
 
-# TODO: idea: implement actors as stored results, add a new mutate_result function
-# that pushes code to the worker that stores the actor, call the code on the
-# actor, re-pickle the actor into the result buffer, and return the result.
-# This breaks the immutability of the object store, but it seems like it could
-# result in an elegant system where actors can be built on top of futures with
-# very little additional code. OTOH, users might be surprised that their object
-# gets pickled after every method call... if it has open file descriptors, etc.,
-# that would break it.
-
-
 from enum import Enum
 import cloudpickle
 from dataclasses import dataclass
@@ -100,11 +90,6 @@ class FutureClaim:
     claimed_at: SecondsSinceEpoch
 
 
-# TODO: create a put_object function
-# that doesn't require a corresponding future. Then get() can be used to get
-# any object, regardless of whether it was created by a future. Document the
-# downside: objects created by futures can be recovered by recomputing the
-# future, objects created by put cannot be recovered.
 @dataclass(frozen=True)
 class ObjectRefBase(Generic[T]):
     timestamp: SecondsSinceEpoch
@@ -124,14 +109,13 @@ class ActorRef(ObjectRefBase[T]):
 
 ObjectRef = BufferRef[T] | ActorRef[T]
 
-# TODO: function in client get_locality(future) -> Optional[LocalityRequirement]
-# to get the locality info for a future if the future has been realized.
+
 @dataclass(frozen=True)
 class LocalityRequirement(Generic[T]):
     object_ref: ObjectRef[T]
 
 
-Requirements = Union[ResourceRequirements, LocalityRequirement[T]]
+Requirements = ResourceRequirements | LocalityRequirement[T]
 
 
 @dataclass(frozen=True)
@@ -150,11 +134,6 @@ def throw_future_exception(exception: FutureException) -> NoReturn:
     raise RemoteException(msg + exception.message)
 
 
-# TODO: worker must calculate its available memory as the difference between
-# what it currently has in its store and its configured max memory. If it were
-# to use free system memory, that could lead to oversubscription if multiple
-# workers are running on the same machine. It also allows users to intentionally
-# oversubscribe if they want to use swap.
 @dataclass(frozen=True)
 class WorkerResources:
     cpu: int
@@ -474,7 +453,7 @@ def submit_future(
     ss: fdb.Subspace,
     future_code: Callable[..., T],
     args: List[Any],
-    requirements: Union[ResourceRequirements, LocalityRequirement[T]],
+    requirements: ResourceRequirements | LocalityRequirement[T],
     max_retries: int = 3,
     id: Optional[UUID] = None,
     allow_reconstruction: bool = True,
@@ -564,7 +543,7 @@ def get_future_claim(
 
 @fdb.transactional
 def get_future_state(  # type: ignore [return] # TODO: wtf
-    tr: fdb.Transaction, ss: fdb.Subspace, future: Union[UUID, BaseFuture[T]]
+    tr: fdb.Transaction, ss: fdb.Subspace, future: UUID | BaseFuture[T]
 ) -> Optional[Future[T]]:
     """Get the state of a future, identified either by its UUID or a future
     object. Returns None if the future does not exist in FoundationDB."""
@@ -689,7 +668,7 @@ def relinquish_claim(
 def claim_future(
     tr: fdb.Transaction,
     ss: fdb.Subspace,
-    future: Union[UUID, UnclaimedFuture[T]],  # TODO: replace all Union with |
+    future: UUID | UnclaimedFuture[T],
     worker_address: str,
     worker_port: int,
     force: bool = False,
@@ -799,7 +778,7 @@ def fail_future(
     future: ClaimedFuture[T],
     exception_message: str,
     fail_permanently: bool = False,
-) -> Union[FailedFuture[T], ClaimedFuture[T]]:
+) -> FailedFuture[T] | ClaimedFuture[T]:
     """Records an exception that occurred while running the future's code, and
        increments num_attempts on the future.
     Returns a FailedFuture if the future has exceeded its max_retries.
@@ -916,7 +895,7 @@ def _await_future_watch(
     future_id: UUID,
     time_limit_secs: Optional[int] = None,
     presume_worker_dead_after_secs: Optional[int] = None,
-) -> Union[AwaitFailed, ObjectRef[T]]:
+) -> AwaitFailed | ObjectRef[T]:
     """Blocks until the future has been realized and returns its result. If time limit is exceeded, returns None."""
     if isinstance(future_watch, FutureFDBWatch):
         started_at = seconds_since_epoch()
@@ -958,7 +937,7 @@ def await_future(
     future: Future[T],
     time_limit_secs: Optional[int] = None,
     presume_worker_dead_after_secs: Optional[int] = None,
-) -> Union[AwaitFailed, ObjectRef[T]]:
+) -> AwaitFailed | ObjectRef[T]:
     """Blocks until the future has been realized and returns its result.
     If time limit is exceeded, returns AwaitFailed.TimeLimitExceeded.
     If presume_worker_dead_after_secs is provided, returns AwaitFailed.WorkerPresumedDead

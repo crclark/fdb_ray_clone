@@ -86,7 +86,7 @@ client.await_future(y) # returns 8
 
 ## Features
 
-- Simple. 1k lines of Python.
+- Simple. <2k lines of Python.
 - Distributed futures executed by a cluster of workers.
 - Distributed storage of future outputs.
 - Resource requirement system -- specify that your future needs n CPUs, m bytes of memory, etc.
