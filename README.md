@@ -2,7 +2,15 @@
 
 A very very minimal distributed futures system written in pure Python on top of FoundationDB, vaguely inspired by Ray. Only three direct dependencies!
 
-**This is just an educational toy for myself. Not for real-world use.** It's also a nice testimonial for the ease-of-use of FoundationDB.
+**This is just an educational toy for myself. Not for real-world use.** It's also a nice testimonial for the ease-of-use of FoundationDB -- everything as of commit 83ab44dde was implemented in a week.
+
+## Features
+
+- Simple. <2k lines of Python.
+- Distributed futures executed by a cluster of workers.
+- Distributed storage of future outputs.
+- Resource requirement system -- specify that your future needs n CPUs, m bytes of memory, etc.
+- Fault tolerant -- retries, exception reporting, detects dead workers and reassigns their work, simple lineage system that can reconstruct lost outputs.
 
 ## Quick start
 
@@ -16,7 +24,13 @@ https://apple.github.io/foundationdb/downloads.html
 
 `poetry run python fdb_ray_clone/worker.py --address=127.0.0.1 --port=50001 demo_cluster_name`
 
+Start as many as you want, but use a different port for each one. Each worker polls FoundationDB for futures to execute, stores the results in its memory, and serves the results from the given address and port.
+
 ### Create some futures
+
+The client API writes futures to FoundationDB, uses FoundationDB watches to be notified when a worker has finished a future, and then connects directly to the worker's [SharedMemoryManager](https://docs.python.org/3/library/multiprocessing.shared_memory.html#multiprocessing.managers.SharedMemoryManager) to fetch the result.
+
+See [the future docs](./docs/futures.md) for the details of how futures are implemented.
 
 ```python
 import fdb_ray_clone.client as client
@@ -38,6 +52,8 @@ client.await_future(
 ```
 
 ### Create an actor
+
+See [the docs](./docs/actors.md) for more about how actors were implemented.
 
 ```python
 import fdb_ray_clone.client as client
@@ -81,17 +97,6 @@ y = client.submit_future(
 client.await_future(y) # returns 8
 ```
 
-
-
-
-## Features
-
-- Simple. <2k lines of Python.
-- Distributed futures executed by a cluster of workers.
-- Distributed storage of future outputs.
-- Resource requirement system -- specify that your future needs n CPUs, m bytes of memory, etc.
-- Fault tolerant -- retries, exception reporting, detects dead workers and reassigns their work, simple lineage system that can reconstruct lost outputs.
-
 ## Data plane
 
 Each worker process is running a Python [SharedMemoryManager](https://docs.python.org/3/library/multiprocessing.shared_memory.html#multiprocessing.managers.SharedMemoryManager), which is a lightweight way to share memory between Python processes over a network. The hello world of SharedMemoryManager examples crashes in my system Python [because of a bug](https://stackoverflow.com/questions/59172691/why-do-we-get-a-nameerror-when-trying-to-use-the-sharedmemorymanager-python-3-8), so this requires Python >3.8.
@@ -126,4 +131,4 @@ stateDiagram-v2
 # High-priority TODOs
 
 - Implement a general put(). See TODO on FutureResult class.
-- Implement actors. Method calls on actors could be futures with locality constraints. Actors themselves could either be stored in buffers and deserialized/reserialized on every call (easier, but limiting), or stored separately in the Store.
+
