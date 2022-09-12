@@ -106,12 +106,23 @@ class FutureClaim:
 # downside: objects created by futures can be recovered by recomputing the
 # future, objects created by put cannot be recovered.
 @dataclass(frozen=True)
-class ObjectRef(Generic[T]):
+class ObjectRefBase(Generic[T]):
     timestamp: SecondsSinceEpoch
     worker_id: WorkerId
-    name: str
     future_id: UUID
 
+
+@dataclass(frozen=True)
+class BufferRef(ObjectRefBase[T]):
+    buffer_name: str
+
+
+@dataclass(frozen=True)
+class ActorRef(ObjectRefBase[T]):
+    pass
+
+
+ObjectRef = BufferRef[T] | ActorRef[T]
 
 # TODO: function in client get_locality(future) -> Optional[LocalityRequirement]
 # to get the locality info for a future if the future has been realized.
@@ -168,6 +179,7 @@ class BaseFuture(Generic[T]):
     # https://stackoverflow.com/q/59621745
     requirements: Requirements[U]  # type: ignore [valid-type]
     max_retries: int
+    allow_reconstruction: bool
 
 
 @dataclass(frozen=True)
@@ -465,6 +477,7 @@ def submit_future(
     requirements: Union[ResourceRequirements, LocalityRequirement[T]],
     max_retries: int = 3,
     id: Optional[UUID] = None,
+    allow_reconstruction: bool = True,
 ) -> UnclaimedFuture[T]:
     """Submit a future to the cluster.
 
@@ -492,12 +505,14 @@ def submit_future(
         requirements=requirements,
         max_retries=max_retries,
         num_attempts=0,
+        allow_reconstruction=allow_reconstruction,
     )
     future_ss = ss.subspace(("future", id))
     tr[future_ss.pack(("code",))] = cloudpickle.dumps(future_code)
     tr[future_ss.pack(("args",))] = cloudpickle.dumps(args)
     tr[future_ss.pack(("requirements",))] = pickle.dumps(requirements)
     tr[future_ss.pack(("max_retries",))] = pickle.dumps(max_retries)
+    tr[future_ss.pack(("allow_reconstruction",))] = pickle.dumps(allow_reconstruction)
 
     write_requirements(tr, ss, future.id, requirements)
     return future
@@ -572,6 +587,7 @@ def get_future_state(  # type: ignore [return] # TODO: wtf
     args = tr[future_ss["args"]]
     requirements = tr[future_ss["requirements"]]
     latest_exception = tr[future_ss["latest_exception"]]
+    allow_reconstruction = tr[future_ss["allow_reconstruction"]]
 
     if not future_exists(tr, ss, future_id):
         return None
@@ -596,6 +612,7 @@ def get_future_state(  # type: ignore [return] # TODO: wtf
                 max_retries=max_retries,
                 num_attempts=num_attempts,
                 latest_exception=must_unpickle(latest_exception.wait()),
+                allow_reconstruction=must_unpickle(allow_reconstruction.wait()),
             )
         case (None, None, num_attempts, max_retries):
             return UnclaimedFuture(
@@ -605,6 +622,7 @@ def get_future_state(  # type: ignore [return] # TODO: wtf
                 requirements=must_unpickle(requirements.wait()),
                 max_retries=max_retries,
                 num_attempts=num_attempts,
+                allow_reconstruction=must_unpickle(allow_reconstruction.wait()),
             )
 
         case (FutureClaim(), None, num_attempts, max_retries):
@@ -617,8 +635,9 @@ def get_future_state(  # type: ignore [return] # TODO: wtf
                 claim=claim,
                 num_attempts=num_attempts,
                 latest_exception=unpickle(latest_exception.wait()),
+                allow_reconstruction=must_unpickle(allow_reconstruction.wait()),
             )
-        case (None, ObjectRef(), num_attempts, max_retries):
+        case (None, ObjectRef, num_attempts, max_retries):
             return RealizedFuture(
                 id=future_id,
                 code=must_unpickle(code.wait()),
@@ -628,6 +647,7 @@ def get_future_state(  # type: ignore [return] # TODO: wtf
                 num_attempts=num_attempts,
                 latest_result=latest_result,
                 latest_exception=unpickle(latest_exception.wait()),
+                allow_reconstruction=must_unpickle(allow_reconstruction.wait()),
             )
         case _:
             raise Exception(
@@ -635,8 +655,6 @@ def get_future_state(  # type: ignore [return] # TODO: wtf
             )
 
 
-# TODO: we also need a more general resubmit_future that can transition a future
-# from any state to unclaimed, in case an object has been lost by worker death.
 @fdb.transactional
 def relinquish_claim(
     tr: fdb.Transaction, ss: fdb.Subspace, future: ClaimedFuture[T]
@@ -661,6 +679,7 @@ def relinquish_claim(
         requirements=future.requirements,
         max_retries=future.max_retries,
         num_attempts=future.num_attempts,
+        allow_reconstruction=future.allow_reconstruction,
     )
 
 
@@ -708,6 +727,7 @@ def claim_future(
         claim=claim,
         num_attempts=0,
         latest_exception=None,
+        allow_reconstruction=unclaimed_future.allow_reconstruction,
     )
 
 
@@ -716,13 +736,16 @@ def realize_future(
     tr: fdb.Transaction,
     ss: fdb.Subspace,
     future: ClaimedFuture[T],
-    name: str,
+    object_id: str | UUID,
 ) -> RealizedFuture[T]:
     """
     The worker calls this function when it has successfully computed the result
     of the future.
     Throws without recording the result if the worker's claim on the future has
     expired.
+
+    object_id is a string buffer_name if the object is a buffer and a UUID if
+    the object is an actor.
     """
 
     if not future_exists(tr, ss, future.id):
@@ -737,11 +760,19 @@ def realize_future(
         raise ClaimLostException(
             f"Worker {worker_id} lost claim on Future {future.id} while working on it. Current claim is {latest_claim}."
         )
-    future_result: ObjectRef[T] = ObjectRef(
-        timestamp=seconds_since_epoch(),
-        worker_id=worker_id,
-        name=name,
-        future_id=future.id,
+    future_result: ObjectRef[T] = (
+        BufferRef(
+            timestamp=seconds_since_epoch(),
+            worker_id=worker_id,
+            buffer_name=object_id,
+            future_id=future.id,
+        )
+        if isinstance(object_id, str)
+        else ActorRef(
+            timestamp=seconds_since_epoch(),
+            worker_id=worker_id,
+            future_id=future.id,
+        )
     )
     tr[future_ss["latest_result"]] = pickle.dumps(future_result)
     # TODO: blind writes are brittle
@@ -757,6 +788,7 @@ def realize_future(
         num_attempts=future.num_attempts + 1,
         latest_result=future_result,
         latest_exception=latest_exception,
+        allow_reconstruction=future.allow_reconstruction,
     )
 
 
@@ -804,6 +836,7 @@ def fail_future(
             max_retries=future.max_retries,
             num_attempts=future.max_retries + 1,
             latest_exception=future_exception,
+            allow_reconstruction=future.allow_reconstruction,
         )
     else:
         return ClaimedFuture(
@@ -815,6 +848,7 @@ def fail_future(
             claim=future.claim,
             num_attempts=future.num_attempts + 1,
             latest_exception=future_exception,
+            allow_reconstruction=future.allow_reconstruction,
         )
 
 

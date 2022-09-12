@@ -37,6 +37,26 @@ client.await_future(
 
 ```
 
+### Create an actor
+
+```python
+import fdb_ray_clone.client as client
+
+client.init("demo_cluster_name")
+
+class Foo:
+    def __init__(self, x: int):
+        self.x = x
+    def foo(self, y: int) -> int:
+        return self.x + y
+
+actor_future = client.create_actor(Foo, 1)
+actor = client.await_future(actor_future)
+
+call_future = client.call_actor(actor, "foo", 2)
+client.await_future(call_future) # returns 3
+```
+
 #### Locality requirements
 
 You can require that a future run on the same worker as a previous future, to ensure that the new future has fast access to the previous future's results, without network transfer overhead.
@@ -52,7 +72,8 @@ client.await_future(x)
 locality = client.locality(x)
 
 # If you want to test lineage reconstruction, ctrl-c the
-# worker and restart it before running the next line.
+# worker and restart it before running the next line. x
+# will get recomputed as part of awaiting y.
 
 y = client.submit_future(
     lambda x, y: client.await_future(x) + y, x, 5, locality=locality

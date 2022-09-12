@@ -1,4 +1,5 @@
-from typing import Any, Union
+from dataclasses import dataclass
+from typing import Any, Dict, Generic, Optional, TypeVar, Union
 import uuid
 import pickle
 from multiprocessing.managers import SharedMemoryManager
@@ -6,8 +7,22 @@ from multiprocessing.shared_memory import SharedMemory
 import pyarrow as pa
 import pickle
 
+# TODO: types that are used by both data and control should be defined in a separate
+# module.
+from fdb_ray_clone.control.future import ObjectRef, BufferRef, ActorRef
+
 PYARROW_WRITE_OPTIONS = pa.ipc.IpcWriteOptions(compression="lz4")
 AUTH_KEY = b"not_very_secure"
+
+T = TypeVar("T")
+
+
+@dataclass(frozen=True)
+class Actor(Generic[T]):
+    """A wrapper that signals to the worker that we need to create an actor, not
+    just store an object."""
+
+    actor: T
 
 
 class StoreServer(object):
@@ -21,7 +36,9 @@ class StoreServer(object):
         self.smm = SharedMemoryManager((bind_address, bind_port), authkey=AUTH_KEY)
         self.smm.register("get", self.get)
         self.smm.register("get_used_ram", self.get_used_ram)
+        # TODO: use psutil instead https://stackoverflow.com/a/21632554/108268
         self.used_ram = 0
+        self.actors: Dict[uuid.UUID, Any] = dict()
 
     def __enter__(self) -> "StoreServer":
         self.smm.start()
@@ -81,7 +98,7 @@ class StoreServer(object):
 
     def can_store(self, x: Union[pa.Table, Any]) -> bool:
         """Returns True if x can be passed to store_local, False otherwise."""
-        if isinstance(x, pa.Table):
+        if isinstance(x, pa.Table) or isinstance(x, Actor):
             return True
         try:
             pickle.dumps(x, protocol=5)
@@ -89,13 +106,27 @@ class StoreServer(object):
         except pickle.PicklingError:
             return False
 
-    # TODO: `name` is a terrible name; find a better one.
-    def has_name(self, name: str) -> bool:
+    def has_buffer_name(self, name: str) -> bool:
         try:
             self.get(name)
             return True
         except FileNotFoundError:
             return False
+
+    def __contains__(self, object_ref: ObjectRef[T]) -> bool:
+        match object_ref:
+            case BufferRef(buffer_name=buffer_name):
+                return self.has_buffer_name(buffer_name)
+            case ActorRef(future_id=future_id):
+                return future_id in self.actors
+
+    def create_actor(self, future_id: uuid.UUID, actor: Any) -> None:
+        self.actors[future_id] = actor
+
+
+# Contains a reference to the store on the current process, if and only if the
+# current process is a worker. Otherwise, None.
+WORKER_STORE_SERVER: Optional[StoreServer] = None
 
 
 class StoreClient(object):

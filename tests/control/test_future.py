@@ -46,6 +46,7 @@ def nonexistent_future() -> future.UnclaimedFuture[int]:
         max_retries=3,
         id=UUID("00000000-0000-0000-0000-000000000000"),
         num_attempts=0,
+        allow_reconstruction=True,
     )
 
 
@@ -133,9 +134,10 @@ def test_realize_future(db: fdb.Database, subspace: fdb.Subspace) -> None:
     f = future.get_future_state(db, subspace, f)
 
     assert isinstance(f, future.RealizedFuture)
+    assert isinstance(f.latest_result, future.BufferRef)
     assert f.latest_result.worker_id.address == "localhost"
     assert f.latest_result.worker_id.port == 1234
-    assert f.latest_result.name == "buffername"
+    assert f.latest_result.buffer_name == "buffername"
 
     future_id = future.get_worker_claim_future(
         db, subspace, future.WorkerId("localhost", 1234)
@@ -223,8 +225,9 @@ def test_await_future(db: fdb.Database, subspace: fdb.Subspace) -> None:
 
     result = future.await_future(db, subspace, f)
 
+    assert isinstance(result, future.BufferRef)
     assert result is not None
-    assert result.name == "buffername"
+    assert result.buffer_name == "buffername"
 
 
 def test_await_future_timeout(db: fdb.Database, subspace: fdb.Subspace) -> None:
@@ -291,8 +294,9 @@ def test_await_future_live_worker(db: fdb.Database, subspace: fdb.Subspace) -> N
         db, subspace, f, time_limit_secs=10, presume_worker_dead_after_secs=100
     )
 
+    assert isinstance(result, future.BufferRef)
     assert result is not None
-    assert result.name == "buffername"
+    assert result.buffer_name == "buffername"
 
 
 def test_scan_resource_requirements(db: fdb.Database, subspace: fdb.Subspace) -> None:
@@ -391,7 +395,14 @@ def test_locality_requirements(db: fdb.Database, subspace: fdb.Subspace) -> None
         subspace,
         lambda: 1,
         [],
-        future.LocalityRequirement(future.ObjectRef(1, w1, "buffername", uuid.uuid4())),
+        future.LocalityRequirement(
+            future.BufferRef(
+                timestamp=1,
+                worker_id=w1,
+                buffer_name="buffername",
+                future_id=uuid.uuid4(),
+            )
+        ),
     )
 
     f2 = future.submit_future(
@@ -399,7 +410,14 @@ def test_locality_requirements(db: fdb.Database, subspace: fdb.Subspace) -> None
         subspace,
         lambda: 1,
         [],
-        future.LocalityRequirement(future.ObjectRef(1, w2, "buffername", uuid.uuid4())),
+        future.LocalityRequirement(
+            future.BufferRef(
+                timestamp=1,
+                worker_id=w2,
+                buffer_name="buffername",
+                future_id=uuid.uuid4(),
+            )
+        ),
     )
 
     assignments1 = future.get_all_assignments(db, subspace, w1)

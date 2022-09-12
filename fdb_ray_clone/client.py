@@ -38,8 +38,13 @@ class UpstreamDependencyFailedException(Exception):
     pass
 
 
-# TODO: how does the code within futures get access to a client? We might need
-# a global or something awful like that.
+class UpstreamDependencyFailedNoReconstructionAllowed(Exception):
+    pass
+
+
+@dataclass(frozen=True)
+class Actor(Generic[T]):
+    actor_ref: future.ActorRef[T]
 
 
 class Client(object):
@@ -56,6 +61,7 @@ class Client(object):
     def submit_future(
         self,
         fn: Callable[..., T],
+        # TODO: fix args so that we can pass args and kwargs correctly.
         *args: Any,
         min_cpu: int = 0,
         min_ram: int = 0,
@@ -77,6 +83,46 @@ class Client(object):
                 worker_id.address, worker_id.port
             )
         return self.clients[worker_id]
+
+    # TODO resource reqs/locality
+    def create_actor(self, ctor: Callable[..., T], *args: Any) -> Future[Actor[T]]:
+        def _mk_actor(*args: Any) -> store.Actor[T]:
+            actor = ctor(*args)
+            return store.Actor(actor)
+
+        f: Future[Actor[T]] = Future(
+            _future=future.submit_future(
+                self.db,
+                self.ss,
+                _mk_actor,
+                args,
+                requirements=future.ResourceRequirements(),
+            ),
+        )
+
+        return f
+
+    def call_actor(
+        self, actor_ref: Actor[T], method_name: str, *args: Any
+    ) -> Future[U]:
+        def _call_actor(
+            actor_ref: future.ActorRef[T], method_name: str, *args: Any
+        ) -> U:
+            assert isinstance(store.WORKER_STORE_SERVER, store.StoreServer)
+            actor = store.WORKER_STORE_SERVER.actors[actor_ref.future_id]
+            result: U = getattr(actor, method_name)(*args)
+            return result
+
+        locality = future.LocalityRequirement(actor_ref.actor_ref)
+        return Future(
+            _future=future.submit_future(
+                self.db,
+                self.ss,
+                _call_actor,
+                (actor_ref.actor_ref, method_name, *args),
+                requirements=locality,
+            )
+        )
 
     @fdb.transactional
     def _attempt_resubmit(self, tr: fdb.Transaction, f: Future[T]) -> bool:
@@ -165,7 +211,10 @@ class Client(object):
                         future.throw_future_exception(e)
                     case _:
                         raise Exception("Future failed with unknown exception.")
-            case future.ObjectRef(worker_id=worker_id, name=name) as object_ref:
+            case future.ActorRef() as actor_ref:
+                ret: T = Actor(actor_ref)  # type: ignore [assignment]
+                return ret
+            case future.BufferRef(worker_id=worker_id, buffer_name=name) as buffer_ref:
                 client = self._get_or_create_client(worker_id)
                 # TODO: this can throw various exceptions if the worker is dead.
                 # ConnectionRefusedError, timeouts, etc.
@@ -182,7 +231,7 @@ class Client(object):
                         )
                         # The worker died and restarted and no longer has the result
                         # in its store. We need to resubmit the future.
-                        self._resubmit_bad_object_ref(self.db, f, object_ref)
+                        self._resubmit_bad_object_ref(self.db, f, buffer_ref)
                         return self.await_future(
                             f, time_limit_secs, presume_worker_dead_after_secs
                         )
@@ -217,7 +266,9 @@ def submit_future(
     """Submit a future to the cluster. Returns a Future object that can be used to
     await the result."""
     if GLOBAL_CLIENT is None:
-        raise Exception("Must call fdb_ray_clone.init() before submitting futures.")
+        raise Exception(
+            "Must call fdb_ray_clone.client.init() before submitting futures."
+        )
     return GLOBAL_CLIENT.submit_future(
         fn, *args, min_cpu=min_cpu, min_ram=min_ram, min_gpu=min_gpu, locality=locality
     )
@@ -234,7 +285,9 @@ def await_future(
     having no heartbeat for presume_worker_dead_after_secs), the future
     is resubmitted and the await is retried."""
     if GLOBAL_CLIENT is None:
-        raise Exception("Must call fdb_ray_clone.init() before submitting futures.")
+        raise Exception(
+            "Must call fdb_ray_clone.client.init() before submitting futures."
+        )
     return GLOBAL_CLIENT.await_future(
         f, time_limit_secs, presume_worker_dead_after_secs
     )
@@ -244,5 +297,27 @@ def locality(f: Future[T]) -> List[future.LocalityRequirement[T]]:
     """Get the list of workers that contain the results of this future, if any.
     Returns an empty list if the future is not yet completed, or failed."""
     if GLOBAL_CLIENT is None:
-        raise Exception("Must call fdb_ray_clone.init() before submitting futures.")
+        raise Exception(
+            "Must call fdb_ray_clone.client.init() before submitting futures."
+        )
     return GLOBAL_CLIENT.locality(f)
+
+
+def create_actor(ctor: Callable[..., T], *args: Any) -> Future[Actor[T]]:
+    """Create an actor on the cluster. Returns a Future that can be used to await
+    the actor handle."""
+    if GLOBAL_CLIENT is None:
+        raise Exception(
+            "Must call fdb_ray_clone.client.init() before submitting futures."
+        )
+    return GLOBAL_CLIENT.create_actor(ctor, *args)
+
+
+def call_actor(actor: Actor[T], method_name: str, *args: Any) -> Future[U]:
+    """Call a method on an actor. Returns a Future that can be used to await
+    the result."""
+    if GLOBAL_CLIENT is None:
+        raise Exception(
+            "Must call fdb_ray_clone.client.init() before submitting futures."
+        )
+    return GLOBAL_CLIENT.call_actor(actor, method_name, *args)

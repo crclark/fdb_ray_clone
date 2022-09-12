@@ -61,6 +61,7 @@ def test_worker_process_one_future(worker_config: worker.WorkerConfig) -> None:
     future_result = future.await_future(
         worker_config.db, worker_config.ss, f, time_limit_secs=0
     )
-    buffer_name = future_result.name
+    assert isinstance(future_result, future.BufferRef)
+    buffer_name = future_result.buffer_name
     result = store_client.get(buffer_name)
     assert result == 3

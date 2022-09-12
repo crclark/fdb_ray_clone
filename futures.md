@@ -66,6 +66,7 @@ Contains a list of all futures known to the system.
 - key (`future_id`, 'max_retries'): value: pickled int. The number of times
   to retry realizing the future before giving up. If num_attempts >= max_retries,
   the future will never be realized.
+- key (`future_id`, 'allow_reconstruction'): value: pickled bool. If True, the system is free to reconstruct the future if the worker storing its result has died. This should be set to false if the future's output is dependent on state that was living on the dead worker (such as the state of an actor), or otherwise has dangerous impurity in its behavior.
 - key (`future_id`, 'latest_exception'): value: pickled FutureException object. The exception
   string of the last failure. If this key is not present, the future has never
   failed. If this key is present, the future has failed in the past, but may
@@ -223,22 +224,21 @@ The following failures can occur in the future lifecycle:
 - API to transfer ownership of a future's result to another worker. This
   is also needed for repartitioning.
 - API to put something into the object store locally and register it as a
-  realized future. This is kinda equivalent to `return` in a monadic future API. This might be a bad idea because objects without provenance info break lineage reconstruction.
+  realized future. This is kinda equivalent to `return` in a monadic future API. This might be a bad idea because objects without provenance info break lineage reconstruction. Rough idea: internally, submit a future to ourself (using locality) to implement put. Fail if called on a process that is not itself a worker (clients don't participate in future computation).
 - Reference counting and garbage collection.
-
-How repartitioning should work:
-
-```
-for each current partition:
-  new_partitions = split_into_n_parts(current_partition, n)
-  new_partition_futures = []
-  transfer_ownership_futures = []
-  for new_partition in new_partitions:
-    realized_future = put_realized_future(new_partition)
-    new_partition_futures.append(realized_future)
-    transfer_ownership_future = future(lambda: take_ownership(realized_future), resources={'ram': realized_future.size_in_bytes})
-    transfer_ownership_futures.append(transfer_ownership_future)
-  await_all(transfer_ownership_futures)
-  delete_all(transfer_ownership_futures) # boring cleanup since we don't have GC yet
-  delete_future(current_partition)
-```
+- Performance optimizations: when awaiting, connect directly to the worker's object store and poll it instead of using an FDB watch + a request. Serialize small objects into FoundationDB ObjectRefs directly to avoid hops and guard against worker death. Push future assignments directly from clients to workers instead of relying on workers to poll. All of these are relatively easy and would greatly improve constant latency overhead.
+- Distributed datasets. For example, how repartitioning should work:
+  ```
+  for each current partition:
+    new_partitions = split_into_n_parts(current_partition, n)
+    new_partition_futures = []
+    transfer_ownership_futures = []
+    for new_partition in new_partitions:
+      realized_future = put_realized_future(new_partition)
+      new_partition_futures.append(realized_future)
+      transfer_ownership_future = future(lambda: take_ownership(realized_future), resources={'ram': realized_future.size_in_bytes})
+      transfer_ownership_futures.append(transfer_ownership_future)
+    await_all(transfer_ownership_futures)
+    delete_all(transfer_ownership_futures) # boring cleanup since we don't have GC yet
+    delete_future(current_partition)
+  ```

@@ -10,6 +10,7 @@ We need the following processes per worker:
 
 import fdb_ray_clone.control.future as future
 from fdb_ray_clone.data.store import StoreServer, StoreClient
+import fdb_ray_clone.data.store as data_store
 import fdb_ray_clone.client as client
 
 from uuid import UUID
@@ -114,6 +115,35 @@ def _work_on_future_with_retries(config: WorkerConfig, f: future.Future[T]) -> T
         return result
 
 
+@fdb.transactional
+def _permafail_assigned_future(
+    tr: fdb.Transaction,
+    config: WorkerConfig,
+    assigned_future: future.Future[T],
+    upstream_exception: Exception,
+) -> None:
+    """Fail an assigned future because its upstream requirement failed and can't be reconstructed."""
+    future.clear_worker_assignment(tr, config.ss, config.worker_id, assigned_future.id)
+    # State machine only allows us to fail a future we have claimed,
+    # so we need to claim it first.
+    claimed_future = future.claim_future(
+        tr,
+        config.ss,
+        assigned_future,
+        config.worker_id.address,
+        config.worker_id.port,
+    )
+    future.fail_future(
+        tr,
+        config.ss,
+        claimed_future,
+        _exception_to_string(
+            client.UpstreamDependencyFailedNoReconstructionAllowed(upstream_exception)
+        ),
+        fail_permanently=True,
+    )
+
+
 # TODO: need comprehensive tests for this. Test all cases, and test that it
 # works recursively with chains of dependencies.
 @fdb.transactional
@@ -123,8 +153,6 @@ def _claim_assigned_future(
     """Claim a future that was assigned to this worker by the LocalityRequirement
     system. These are futures that the client believed that only this particular
     worker can process because this worker holds a particular object."""
-
-    logging.info("Entered _claim_assigned_future")
 
     @fdb.transactional
     def claim_or_reassign(  # type: ignore [return] # TODO: hitting this mpypy bug (?) a lot
@@ -140,7 +168,7 @@ def _claim_assigned_future(
         design doc for more details."""
         assigned_future = future.get_future_state(tr, config.ss, assigned_future_id)
         logging.info(f"Examining assigned future {assigned_future}")
-        if config.store.has_name(why_assigned.name):
+        if why_assigned in config.store:
             # We still have the objectref needed by this future. Claim it.
             future.clear_worker_assignment(
                 tr, config.ss, config.worker_id, assigned_future_id
@@ -184,33 +212,27 @@ def _claim_assigned_future(
                     return None
                 case future.FailedFuture(latest_exception=upstream_exception):
                     # Someone (maybe even us) tried to re-try the upstream
-                    # future but it hit its max retries limit. Our assignedassigned_future_id
+                    # future but it hit its max retries limit. Our assigned_future_id
                     # future can't be realized because this dependency is missing,
                     # so we need to transition our assigned future to the failed state.
 
                     logging.info(
                         f"Upstream future has failed. Failing assigned future."
                     )
-                    future.clear_worker_assignment(
-                        tr, config.ss, config.worker_id, assigned_future_id
+                    _permafail_assigned_future(
+                        tr, config, assigned_future, upstream_exception
                     )
-                    # State machine only allows us to fail a future we have claimed,
-                    # so we need to claim it first.
-                    claimed_future = future.claim_future(
-                        tr,
-                        config.ss,
-                        assigned_future,
-                        config.worker_id.address,
-                        config.worker_id.port,
+                    return None
+                case future.RealizedFuture(
+                    allow_reconstruction=allow_reconstruction
+                ) if not allow_reconstruction:
+                    # The upstream future cannot be reconstructed. Transition the
+                    # assigned future to the failed state.
+                    logging.info(
+                        f"Upstream future has failed and is configured to disallow reconstruction. Failing assigned future."
                     )
-                    future.fail_future(
-                        tr,
-                        config.ss,
-                        claimed_future,
-                        _exception_to_string(
-                            client.UpstreamDependencyFailedException(upstream_exception)
-                        ),
-                        fail_permanently=True,
+                    _permafail_assigned_future(
+                        tr, config, assigned_future, upstream_exception
                     )
                     return None
                 case future.RealizedFuture(
@@ -263,7 +285,6 @@ def _current_resources(config: WorkerConfig) -> future.WorkerResources:
 def _claim_one_future(
     tr: fdb.Transaction, config: WorkerConfig
 ) -> Optional[future.ClaimedFuture[T]]:
-    logging.info("Entered _claim_one_future")
     current_resources = _current_resources(config)
     eligible_futures = future.futures_fitting_resources(
         tr, config.ss, current_resources
@@ -278,22 +299,31 @@ def _claim_one_future(
         return None
 
 
-def _store_result(config: WorkerConfig, f: future.Future[T], result: T) -> str:
-    buffer = config.store.store_local(result)
-    return buffer.name
+def _store_result(config: WorkerConfig, f: future.Future[T], result: T) -> str | UUID:
+    match result:
+        case data_store.Actor(x):
+            future_id = f.id
+            config.store.create_actor(future_id, x)
+            return future_id
+        case _:
+            buffer = config.store.store_local(result)
+            return buffer.name
 
 
 def _realize_future(
-    config: WorkerConfig, f: future.Future[T], buffer_name: str
+    config: WorkerConfig,
+    f: future.Future[T],
+    buffer_name_or_actor_future_id: str | UUID,
 ) -> None:
-    logging.info("Realizing future %s with buffer %s", f, buffer_name)
-    future.realize_future(config.db, config.ss, f, buffer_name)
+    logging.info(
+        f"Realizing future {f} with object/actor id {buffer_name_or_actor_future_id}"
+    )
+    future.realize_future(config.db, config.ss, f, buffer_name_or_actor_future_id)
 
 
 def _process_one_future(config: WorkerConfig) -> None:
     # To avoid deadlock, randomize whether we look at assigned futures or
     # any future that fits on this worker.
-    logging.info("Looking for future to process.")
     f = (
         _claim_one_future(config.db, config)
         or _claim_assigned_future(config.db, config)
@@ -301,18 +331,16 @@ def _process_one_future(config: WorkerConfig) -> None:
         else _claim_assigned_future(config.db, config)
         or _claim_one_future(config.db, config)
     )
-    logging.info(f"Found {f}")
 
     if f is None:
         # TODO: make configurable
-        logging.debug("No work to do. Sleeping for 5 seconds.")
         time.sleep(5)
         return None
     else:
         logging.info("Found a future to process: %s", f)
         result = _work_on_future_with_retries(config, f)
-        buffer_name = _store_result(config, f, result)
-        _realize_future(config, f, buffer_name)
+        buffer_name_or_actor_future_id = _store_result(config, f, result)
+        _realize_future(config, f, buffer_name_or_actor_future_id)
 
 
 # https://stackoverflow.com/a/20186516
@@ -409,6 +437,7 @@ def main(
 
     db = fdb.open()
     with StoreServer(bind_address=worker_id.address, bind_port=worker_id.port) as store:
+        data_store.WORKER_STORE_SERVER = store
         heartbeat_worker = Process(
             target=heartbeat_loop,
             args=(
